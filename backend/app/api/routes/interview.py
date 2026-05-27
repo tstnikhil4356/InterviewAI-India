@@ -1,11 +1,12 @@
 """
-interview.py — Fixed & Enhanced
+interview.py — Fixed & Enhanced v2
 Fixes:
   1. Session persistence to disk (survives dev-server restarts → no more 404)
   2. misbehavior_count properly wired into generate_follow_up
   3. terminated flag propagated to frontend
   4. Speech metrics tracked per answer (filler words, word count, fluency)
   5. Report returns misbehavior_count, terminated, speech_metrics
+  6. Quality assessment now discriminative (not all 55s)
 """
 
 import json
@@ -30,7 +31,7 @@ SESSION_DIR = Path("/tmp/interview_sessions")
 SESSION_DIR.mkdir(parents=True, exist_ok=True)
 
 
-def _save_session(session_id: str, session: dict) -> None:
+def save_session(session_id: str, session: dict) -> None:
     try:
         with open(SESSION_DIR / f"{session_id}.json", "w") as f:
             json.dump(session, f, default=str)
@@ -38,7 +39,7 @@ def _save_session(session_id: str, session: dict) -> None:
         print(f"[SESSION SAVE ERROR] {e}")
 
 
-def _load_session_disk(session_id: str) -> dict | None:
+def load_session_disk(session_id: str) -> dict | None:
     try:
         p = SESSION_DIR / f"{session_id}.json"
         if p.exists():
@@ -49,10 +50,10 @@ def _load_session_disk(session_id: str) -> dict | None:
     return None
 
 
-def _get_session(session_id: str) -> dict:
+def get_session(session_id: str) -> dict:
     s = _sessions.get(session_id)
     if not s:
-        s = _load_session_disk(session_id)
+        s = load_session_disk(session_id)
         if s:
             _sessions[session_id] = s
         else:
@@ -68,7 +69,7 @@ FILLER_WORDS = [
 ]
 
 
-def _compute_speech_metrics(text: str) -> dict:
+def compute_speech_metrics(text: str) -> dict:
     if not text or len(text.strip()) < 3:
         return {
             "word_count": 0, "filler_count": 0, "filler_words_found": [],
@@ -183,7 +184,7 @@ async def start_interview(
         "speech_metrics_log": [],
     }
     _sessions[session_id] = session
-    _save_session(session_id, session)
+    save_session(session_id, session)
 
     return {
         "session_id": session_id,
@@ -201,12 +202,12 @@ class NextQuestionRequest(BaseModel):
 
 @router.post("/next-question")
 async def next_question(body: NextQuestionRequest):
-    session = _get_session(body.session_id)
+    session = get_session(body.session_id)
     if session["status"] != "active":
         raise HTTPException(400, "Interview is not active")
 
     # Compute speech metrics for this answer
-    speech = _compute_speech_metrics(body.transcript)
+    speech = compute_speech_metrics(body.transcript)
     session["speech_metrics_log"].append({
         "question": session["current_question"],
         "metrics": speech,
@@ -242,7 +243,7 @@ async def next_question(body: NextQuestionRequest):
         session["status"] = "terminated"
         session["terminated"] = True
         session["termination_message"] = result.get("reaction", "Interview terminated.")
-        _save_session(body.session_id, session)
+        save_session(body.session_id, session)
 
         # TTS the termination message
         audio_b64 = await text_to_speech(result["reaction"])
@@ -257,7 +258,7 @@ async def next_question(body: NextQuestionRequest):
     # ── Natural end ───────────────────────────────────────────────────────
     if result is None:
         session["status"] = "completed"
-        _save_session(body.session_id, session)
+        save_session(body.session_id, session)
         return {"done": True, "terminated": False}
 
     # ── Misbehavior strike (non-terminal) ──────────────────────────────────
@@ -286,7 +287,7 @@ async def next_question(body: NextQuestionRequest):
     session["current_question"] = next_q
     session["current_reaction"] = reaction
     session["question_count"] += 1
-    _save_session(body.session_id, session)
+    save_session(body.session_id, session)
 
     return {
         "done": False,
@@ -310,7 +311,7 @@ class CounterRequest(BaseModel):
 
 @router.post("/counter")
 async def counter(body: CounterRequest):
-    session = _get_session(body.session_id)
+    session = get_session(body.session_id)
     if session["status"] != "active":
         raise HTTPException(400, "Interview is not active")
 
@@ -323,24 +324,24 @@ async def counter(body: CounterRequest):
 
     from app.services.groq_client import chat
 
-    context = f"""You are a DOMINANT, senior technical interviewer. You do NOT get pushed around.
-You just asked: "{session['current_question']}"
-Your previous reaction was: "{session['current_reaction']}"
-The candidate pushed back with: "{body.counter_text}"
-Counter exchange: {len(turns)} message(s)
-Force move on: {force_move_on}
+    context = f"""You are a DOMINANT, senior technical interviewer. You do NOT get pushed around.  
+You just asked: "{session['current_question']}"  
+Your previous reaction was: "{session['current_reaction']}"  
+The candidate pushed back with: "{body.counter_text}"  
+Counter exchange: {len(turns)} message(s)  
+Force move on: {force_move_on}  
 
-{"Since this has gone on long enough, FIRMLY shut it down and restate your original question. Be cold." if force_move_on else "Respond with authority. If they make a valid point, acknowledge it in ONE word then move on. If they're deflecting, call it out directly. You do not apologise, you do not soften your tone."}
+{"Since this has gone on long enough, FIRMLY shut it down and restate your original question. Be cold." if force_move_on else "Respond with authority. If they make a valid point, acknowledge it in ONE word then move on. If they're deflecting, call it out directly. You do not apologise, you do not soften your tone."}  
 
 RULES:
-- Maximum 2 sentences. Be SHARP and DIRECT.
-- Never capitulate. Never say 'good point' unless they were genuinely correct.
-- If they're stalling or being difficult: "I noticed that. Let's move on."
-- End by either asking the question again OR stating "Let's continue."
+- Maximum 2 sentences. Be SHARP and DIRECT.  
+- Never capitulate. Never say 'good point' unless they were genuinely correct.  
+- If they're stalling or being difficult: "I noticed that. Let's move on."  
+- End by either asking the question again OR stating "Let's continue."  
 
-Respond with ONLY:
-RESPONSE: [your reply]
-ACTION: repeat_question OR move_on
+Respond with ONLY:  
+RESPONSE: [your reply]  
+ACTION: repeat_question OR move_on  
 """
 
     raw = chat([{"role": "user", "content": context}], temperature=0.6)
@@ -367,7 +368,7 @@ ACTION: repeat_question OR move_on
 
     turns.append({"role": "ai", "text": ai_response})
     session["counter_turns"] = turns
-    _save_session(body.session_id, session)
+    save_session(body.session_id, session)
 
     return {
         "ai_response": ai_response,
@@ -386,10 +387,10 @@ class EndRequest(BaseModel):
 
 @router.post("/end")
 async def end_interview(body: EndRequest):
-    session = _get_session(body.session_id)
+    session = get_session(body.session_id)
     if session["status"] == "active":
         session["status"] = "completed"
-    _save_session(body.session_id, session)
+    save_session(body.session_id, session)
     return {"message": "Interview ended", "session_id": body.session_id}
 
 
@@ -397,7 +398,7 @@ async def end_interview(body: EndRequest):
 
 @router.get("/report/{session_id}")
 async def get_report(session_id: str):
-    session = _get_session(session_id)
+    session = get_session(session_id)
     is_terminated = session.get("terminated", False)
 
     # If terminated with zero history (kicked out on Q1 before submitting any answer),
@@ -441,6 +442,7 @@ async def get_report(session_id: str):
         history=session["history"],
         misbehavior_log=session.get("misbehavior_log"),
         speech_metrics_log=session.get("speech_metrics_log", []),
+        is_terminated=is_terminated,
     )
 
     return {
@@ -461,7 +463,7 @@ async def get_report(session_id: str):
 
 @router.get("/session/{session_id}")
 async def get_session_state(session_id: str):
-    session = _get_session(session_id)
+    session = get_session(session_id)
     return {
         "session_id": session_id,
         "status": session["status"],

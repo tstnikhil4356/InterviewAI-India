@@ -10,7 +10,7 @@ class Settings:
     FRONTEND_URL: str         = os.getenv("FRONTEND_URL", "http://localhost:3000")
 
     # Groq model IDs
-    LLM_MODEL: str            = "llama-3.3-70b-versatile"
+    LLM_MODEL: str            = "llama-3.1-8b-instant"
     WHISPER_MODEL: str        = "whisper-large-v3"
     TTS_VOICE: str            = "en-IN-PrabhatNeural"  # Options: Fritz-PlayAI, Celeste-PlayAI, Briggs-PlayAI
 

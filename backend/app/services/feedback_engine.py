@@ -1,22 +1,40 @@
 """
-feedback_engine.py — Enhanced
-New: speech_metrics_log integrated into report
-    per-question speech analysis (fluency, fillers, stutter)
-    overall speech behaviour summary
-    weighted scoring includes speech clarity
+feedback_engine.py — v9
+
+Core fix: Two LLM calls instead of one.
+  Call 1 (summary call): executive_summary, strengths, improvements,
+                         learning_path, confidence — small, never truncates.
+  Call 2 (per-Q call):   question_feedback only — one entry per Q/A,
+                         shorter prompt, focused entirely on scoring.
+
+This eliminates the token-limit truncation that was causing 2-3 entries
+instead of 9. Each call has a clear, bounded output size.
+
+Other fixes carried forward from v8:
+  - Robust 5-strategy JSON extraction
+  - Backfill guard (still present as safety net)
+  - score_inputs transparency
+  - IDK backfill into learning_path
+  - Banned phrases in critique
+  - Direct integer scores from LLM
 """
 
 import json
 import re
+import logging
 from app.services.groq_client import chat
 
+logger = logging.getLogger(__name__)
+
+# ── Constants ──────────────────────────────────────────────────────────────────
+
+QUALITY_SCORE = {"strong": 90, "good": 75, "average": 55, "weak": 30, "blank": 10}
 
 RUDE_PATTERNS = [
     r"\bstupid\b", r"\bidiot\b", r"\bdumb\b", r"\bwaste\b.*\btime\b",
     r"\bshut up\b", r"\bfuck\b", r"\bscrew\b", r"\bwhatever\b",
     r"\bthis is (dumb|pointless|stupid)\b", r"\bi don'?t care\b",
 ]
-
 IDK_PATTERNS = [
     r"\bi don'?t know\b", r"\bno idea\b", r"\bnot sure\b",
     r"\bnever heard\b", r"\bcan'?t answer\b", r"\bpass\b",
@@ -25,14 +43,16 @@ IDK_PATTERNS = [
 ]
 
 
-def _detect_issues(answer: str) -> dict:
+# ── Helpers ────────────────────────────────────────────────────────────────────
+
+def detect_issues(answer: str) -> dict:
     a = answer.lower()
-    is_rude = any(re.search(p, a) for p in RUDE_PATTERNS)
-    is_idk  = any(re.search(p, a) for p in IDK_PATTERNS)
-    return {"is_rude": is_rude, "is_idk": is_idk}
+    return {
+        "is_rude": any(re.search(p, a) for p in RUDE_PATTERNS),
+        "is_idk":  any(re.search(p, a) for p in IDK_PATTERNS),
+    }
 
-
-def _speech_label(score: int) -> str:
+def speech_label(score: int) -> str:
     if score >= 85: return "Excellent"
     if score >= 70: return "Good"
     if score >= 55: return "Fair"
@@ -40,18 +60,16 @@ def _speech_label(score: int) -> str:
     return "Very Poor"
 
 
-def _aggregate_speech_metrics(speech_metrics_log: list[dict]) -> dict:
-    """Aggregate per-question speech metrics into overall stats."""
+# ── Speech metrics ─────────────────────────────────────────────────────────────
+
+def aggregate_speech_metrics(speech_metrics_log: list[dict]) -> dict:
     if not speech_metrics_log:
         return {}
-
-    total_words      = 0
-    total_fillers    = 0
-    all_fillers      = {}
-    all_repeats      = []
-    fluency_scores   = []
-    too_short_count  = 0
-    too_long_count   = 0
+    total_words = total_fillers = 0
+    all_fillers: dict = {}
+    all_repeats: list = []
+    fluency_scores: list = []
+    too_short_count = too_long_count = 0
 
     for entry in speech_metrics_log:
         m = entry.get("metrics", {})
@@ -62,221 +80,437 @@ def _aggregate_speech_metrics(speech_metrics_log: list[dict]) -> dict:
         all_repeats.extend(m.get("repeated_words", []))
         if m.get("fluency_score") is not None:
             fluency_scores.append(m["fluency_score"])
-        if m.get("too_short"):
-            too_short_count += 1
-        if m.get("too_long"):
-            too_long_count += 1
+        if m.get("too_short"): too_short_count += 1
+        if m.get("too_long"):  too_long_count  += 1
 
     avg_fluency = round(sum(fluency_scores) / len(fluency_scores)) if fluency_scores else 0
     top_fillers = sorted(all_fillers.items(), key=lambda x: -x[1])[:5]
 
-    # Build per-question speech summary
     per_question = []
     for entry in speech_metrics_log:
         m = entry.get("metrics", {})
         issues = []
-        if m.get("filler_count", 0) >= 3:
-            issues.append(f"Used filler words {m['filler_count']}x ({', '.join(m.get('filler_words_found', [])[:3])})")
+        if m.get("filler_count", 0) >= 2:
+            issues.append(f"Filler words used {m['filler_count']}× ({', '.join(m.get('filler_words_found', [])[:3])})")
         if m.get("repeated_words"):
-            issues.append(f"Stuttered/repeated: {', '.join(m['repeated_words'][:3])}")
-        if m.get("too_short"):
-            issues.append("Answer too brief — lacked depth")
-        if m.get("too_long"):
-            issues.append("Answer too long — lost focus")
+            issues.append(f"Repeated words: {', '.join(m['repeated_words'][:3])}")
+        if m.get("too_short"): issues.append("Answer too brief — not enough depth")
+        if m.get("too_long"):  issues.append("Answer too long — lost focus")
         per_question.append({
-            "question": entry["question"][:90] + ("…" if len(entry["question"]) > 90 else ""),
-            "word_count":     m.get("word_count", 0),
-            "filler_count":   m.get("filler_count", 0),
-            "fluency_score":  m.get("fluency_score", 0),
-            "fluency_label":  _speech_label(m.get("fluency_score", 0)),
-            "issues":         issues,
+            "question":      entry["question"][:90] + ("…" if len(entry["question"]) > 90 else ""),
+            "word_count":    m.get("word_count", 0),
+            "filler_count":  m.get("filler_count", 0),
+            "fluency_score": m.get("fluency_score", 0),
+            "fluency_label": speech_label(m.get("fluency_score", 0)),
+            "issues":        issues,
         })
 
     return {
-        "total_words_spoken":   total_words,
-        "total_filler_count":   total_fillers,
-        "top_filler_words":     [{"word": w, "count": c} for w, c in top_fillers],
-        "repeated_words":       list(set(all_repeats))[:8],
-        "avg_fluency_score":    avg_fluency,
-        "fluency_label":        _speech_label(avg_fluency),
-        "too_short_answers":    too_short_count,
-        "too_long_answers":     too_long_count,
-        "per_question":         per_question,
+        "total_words_spoken": total_words,
+        "total_filler_count": total_fillers,
+        "top_filler_words":   [{"word": w, "count": c} for w, c in top_fillers],
+        "repeated_words":     list(set(all_repeats))[:8],
+        "avg_fluency_score":  avg_fluency,
+        "fluency_label":      speech_label(avg_fluency),
+        "too_short_answers":  too_short_count,
+        "too_long_answers":   too_long_count,
+        "per_question":       per_question,
     }
 
+
+# ── Robust JSON extraction ─────────────────────────────────────────────────────
+
+def extract_json(raw: str, fallback_history: list[dict]) -> dict:
+    clean = raw.strip()
+    try:
+        return json.loads(clean)
+    except json.JSONDecodeError:
+        pass
+    if clean.startswith("```"):
+        for part in clean.split("```"):
+            part = part.strip().lstrip("json").strip()
+            try:
+                return json.loads(part)
+            except json.JSONDecodeError:
+                continue
+    m = re.search(r'\{[\s\S]*\}', clean)
+    if m:
+        try:
+            return json.loads(m.group())
+        except json.JSONDecodeError:
+            pass
+    fixed = re.sub(r',\s*}', '}', re.sub(r',\s*]', ']', clean))
+    try:
+        return json.loads(fixed)
+    except json.JSONDecodeError:
+        pass
+    logger.error("All JSON extraction strategies failed — using rule-based fallback")
+    return _build_fallback(fallback_history)
+
+
+def extract_json_array(raw: str) -> list:
+    """Extracts a JSON array from raw LLM response. Returns [] on failure."""
+    clean = raw.strip()
+    # Direct parse
+    try:
+        result = json.loads(clean)
+        if isinstance(result, list):
+            return result
+        if isinstance(result, dict) and "question_feedback" in result:
+            return result["question_feedback"]
+    except json.JSONDecodeError:
+        pass
+    # Strip markdown fences
+    if clean.startswith("```"):
+        for part in clean.split("```"):
+            part = part.strip().lstrip("json").strip()
+            try:
+                result = json.loads(part)
+                if isinstance(result, list): return result
+                if isinstance(result, dict) and "question_feedback" in result:
+                    return result["question_feedback"]
+            except json.JSONDecodeError:
+                continue
+    # Find array boundaries
+    m = re.search(r'\[[\s\S]*\]', clean)
+    if m:
+        try:
+            result = json.loads(m.group())
+            if isinstance(result, list): return result
+        except json.JSONDecodeError:
+            pass
+    # Fix trailing commas then try array
+    fixed = re.sub(r',\s*\]', ']', re.sub(r',\s*}', '}', clean))
+    m2 = re.search(r'\[[\s\S]*\]', fixed)
+    if m2:
+        try:
+            result = json.loads(m2.group())
+            if isinstance(result, list): return result
+        except json.JSONDecodeError:
+            pass
+    # Last resort: extract individual objects from a partial array
+    objects = re.findall(r'\{[^{}]*\}', clean)
+    parsed = []
+    for obj in objects:
+        try:
+            parsed.append(json.loads(obj))
+        except json.JSONDecodeError:
+            continue
+    return parsed
+
+
+# ── Rule-based fallbacks ───────────────────────────────────────────────────────
+
+def _assess_quality(answer: str) -> dict:
+    if not answer or len(answer.strip()) < 10:
+        return {"label": "blank",   "comment": "Answer was too brief to assess.",
+                "ideal": "Provide a complete response with specific examples.",
+                "key_points": ["State your approach", "Give concrete examples"]}
+    w = answer.lower()
+    has_tech    = any(k in w for k in ["python","model","algorithm","accuracy","data","deployed",
+                                        "api","database","implemented","built","optimized","react",
+                                        "sql","docker","tensorflow","pytorch","function","class"])
+    has_metrics = bool(re.search(r'\d+%|\d+\.\d+|\d+x|\d+ ms|\d+k\b', w))
+    has_struct  = any(k in w for k in ["first","then","finally","because","specifically",
+                                        "for example","we used","i built","i designed","i implemented"])
+    n = len(answer)
+    if has_tech and has_metrics and has_struct and n > 200:
+        return {"label": "strong",  "comment": "Strong answer with technical depth, metrics, and clear structure.",
+                "ideal": "Demonstrates deep understanding.", "key_points": ["Depth", "Metrics", "Structure"]}
+    if has_tech and (has_metrics or has_struct) and n > 100:
+        return {"label": "good",    "comment": "Good answer with relevant technical content. Could add more quantitative results.",
+                "ideal": "Add specific metrics and quantify outcomes.", "key_points": ["Show understanding", "Add metrics"]}
+    if has_tech and n > 50:
+        return {"label": "average", "comment": "Shows basic familiarity but answer stays at a surface level.",
+                "ideal": "Explain the specific approach taken and what the outcome was.", "key_points": ["Add specifics", "Quantify"]}
+    if n > 30:
+        return {"label": "weak",    "comment": "Answer lacks technical substance.",
+                "ideal": "Mention specific technologies used and describe your personal contribution.",
+                "key_points": ["Name specific tools", "Describe your role"]}
+    return     {"label": "blank",   "comment": "Answer was too brief.",
+                "ideal": "Expand with technical details and examples.", "key_points": ["Expand answer"]}
+
+
+def _build_fallback(history: list[dict]) -> dict:
+    qf, strengths, improvements, topics = [], [], [], []
+    for i, turn in enumerate(history):
+        a, q = turn.get("answer", ""), turn.get("question", "")
+        quality = _assess_quality(a)
+        qf.append({"question": q, "score": QUALITY_SCORE.get(quality["label"], 55),
+                   "answer_quality": quality["label"],
+                   "answer_summary": a[:80] + ("…" if len(a) > 80 else ""),
+                   "critique": quality["comment"], "ideal_answer_snippet": quality["ideal"],
+                   "ideal_points": quality["key_points"], "_backfilled": True})
+        if quality["label"] in ("strong", "good"):
+            strengths.append(f"Demonstrated relevant technical knowledge on Q{i+1}: {q[:60]}…")
+        if quality["label"] in ("weak", "blank"):
+            improvements.append(f"Q{i+1} lacked technical substance — review core concepts for: {q[:50]}")
+            topics.append({"topic": q[:80], "reason": f"Insufficient answer on Q{i+1}", "priority": "High"})
+
+    avg_w = sum(len(t.get("answer","")) for t in history) / max(len(history), 1)
+    return {
+        "executive_summary": f"Candidate completed {len(history)} questions with {'detailed' if avg_w>150 else 'moderate'} responses. Technical depth varies across topics.",
+        "strengths":    strengths[:3] or ["Completed all interview questions", "Attempted every topic area"],
+        "improvements": improvements[:3] or ["Add specific metrics and tools to answers", "Structure responses: problem → approach → result"],
+        "learning_path": topics[:5],
+        "question_feedback": qf,
+        "confidence_calibration": "balanced",
+        "confidence_note": "Based on answer patterns observed during interview.",
+    }
+
+
+# ── Score computation ──────────────────────────────────────────────────────────
+
+def _calibrate(scores: dict, qf: list[dict]) -> dict:
+    labels = [q.get("answer_quality", "average") for q in qf]
+    if len(set(labels)) == 1 and len(qf) >= 3:
+        scores["confidence_score"] = max(20, scores["confidence_score"] - 15)
+        scores["overall_score"]    = max(10, scores["overall_score"]    - 10)
+    raw = [int(q["score"]) if "score" in q else QUALITY_SCORE.get(q.get("answer_quality","average"), 55) for q in qf]
+    if len(set(raw)) == 1 and len(raw) >= 3:
+        raw = [65 if len(q.get("answer_summary",""))>150 else (45 if len(q.get("answer_summary",""))<50 else v)
+               for v, q in zip(raw, qf)]
+        scores["technical_depth_score"] = round(sum(raw)/len(raw))
+        scores["overall_score"] = round(
+            scores["technical_depth_score"]*0.30 + scores["confidence_score"]*0.20
+            + scores["communication_score"]*0.20 + scores["behaviour_score"]*0.15
+            + scores["speech_clarity_score"]*0.15
+        )
+    return scores
+
+
+def compute_scores(qf: list[dict], speech_log: list[dict], misbehavior: list[dict],
+                   is_terminated: bool, idk_qs: list[str]) -> dict:
+    n   = len(qf)
+    agg = aggregate_speech_metrics(speech_log)
+
+    if n > 0:
+        raw = [int(q["score"]) if "score" in q else QUALITY_SCORE.get(q.get("answer_quality","average"),55) for q in qf]
+        tech = round(sum(raw)/len(raw))
+    else:
+        raw, tech = [], 0
+
+    speech_clarity = agg.get("avg_fluency_score", 50) if agg else 50
+    strikes        = len(misbehavior)
+    behaviour      = max(0, 100 - strikes*28)
+    if is_terminated: behaviour = min(behaviour, 30)
+
+    idk_ratio   = len(idk_qs) / max(n, 1)
+    avg_wc      = (sum(e.get("metrics",{}).get("word_count",0) for e in speech_log) / max(len(speech_log),1)) if speech_log else 50
+    word_signal = min(100, max(0, (avg_wc-20)/80*60+40))
+    confidence  = min(88, max(10, round(tech*0.4 + word_signal*0.4 - idk_ratio*50)))
+    communication = min(85, round(speech_clarity*0.40 + tech*0.35 + behaviour*0.25))
+    overall       = min(88, round(tech*0.30 + confidence*0.20 + communication*0.20 + behaviour*0.15 + speech_clarity*0.15))
+
+    scores = {
+        "overall_score":         overall,
+        "technical_depth_score": tech,
+        "confidence_score":      confidence,
+        "communication_score":   communication,
+        "behaviour_score":       behaviour,
+        "speech_clarity_score":  speech_clarity,
+        "score_inputs": {
+            "quality_scores": raw,
+            "avg_fluency":    agg.get("avg_fluency_score",0) if agg else 0,
+            "strikes":        strikes,
+            "idk_ratio":      round(idk_ratio, 2),
+            "avg_word_count": round(avg_wc, 1),
+        },
+    }
+    return _calibrate(scores, qf)
+
+
+# ── LLM Call 1: Summary ────────────────────────────────────────────────────────
+
+def _call_summary(role: str, convo_text: str, speech_ctx: str, strikes_ctx: str) -> dict:
+    """
+    Generates: executive_summary, strengths, improvements, learning_path,
+    confidence_calibration, confidence_note.
+    Small output — never hits token limits.
+    """
+    prompt = f"""You are a Senior Engineering Manager writing a post-interview assessment for {role}.
+
+Transcript:
+{convo_text}
+{speech_ctx}
+{strikes_ctx}
+
+Return ONLY valid JSON, no markdown:
+{{
+  "executive_summary": "3-4 sentences. Reference specific technologies and topics from the transcript. Assess technical readiness honestly. No filler phrases like 'shows promise'.",
+  "strengths": [
+    "Evidence-based strength citing a specific question/answer (e.g. 'Correctly explained X trade-off in Q3')",
+    "Another specific strength"
+  ],
+  "improvements": [
+    "Specific gap with actionable guidance (e.g. 'Q5 on X was surface-level — needs to understand Y')",
+    "Second specific improvement",
+    "Third specific improvement"
+  ],
+  "learning_path": [
+    {{"topic": "Specific concept", "priority": "High|Medium", "reason": "What the transcript revealed about this gap"}}
+  ],
+  "confidence_calibration": "under-confident | balanced | over-confident",
+  "confidence_note": "One sentence grounded in actual answers, not generic."
+}}"""
+
+    raw = chat([{"role": "user", "content": prompt}], temperature=0.2)
+    result = extract_json(raw, [])
+    result.setdefault("executive_summary", "Assessment unavailable.")
+    result.setdefault("strengths", ["Completed all interview questions"])
+    result.setdefault("improvements", ["Add specific metrics to technical answers", "Structure: problem → approach → result"])
+    result.setdefault("learning_path", [])
+    result.setdefault("confidence_calibration", "balanced")
+    result.setdefault("confidence_note", "")
+    return result
+
+
+# ── LLM Call 2: Per-question feedback ─────────────────────────────────────────
+
+def _call_question_feedback(role: str, history: list[dict]) -> list[dict]:
+    """
+    Generates one feedback entry per Q/A pair.
+    Called separately to avoid token limit truncation.
+    Each Q/A is scored independently in a focused prompt.
+    """
+    # Build a compact transcript — just Q and A, no system context
+    qa_lines = "\n".join(
+        f"Q{i+1}: {t['question']}\nA{i+1}: {t['answer'][:600]}"  # cap individual answers at 600 chars
+        for i, t in enumerate(history)
+    )
+    n = len(history)
+
+    prompt = f"""You are evaluating {n} interview answers for a {role} position.
+
+{qa_lines}
+
+━━━ SCORING RUBRIC ━━━
+85-100: Correct + specific tool/metric/example + explains trade-offs
+65-84:  Correct direction + some specifics + solid understanding
+40-64:  Broad understanding, surface-level, no concrete evidence
+20-39:  Significant gaps or incorrect understanding
+0-19:   No attempt or completely off-topic
+
+━━━ SCORING RULES ━━━
+- Vary scores naturally: use values like 71, 63, 84, 58
+- On-topic but shallow: 55-65, never above 70
+- Partial/correct understanding: 50-65 (credit for genuine attempts)
+- Below 40 only for wrong facts or no attempt
+
+━━━ CRITIQUE RULES ━━━
+BANNED: "not specific enough", "lacked specificity", "more detail", "good attempt", "overall good"
+REQUIRED:
+- Quote or paraphrase what they actually said
+- Name the exact missing concept, tool, or metric
+- For partial answers: acknowledge what was right first
+- For shallow answers: describe concretely what depth looks like
+
+Return ONLY a JSON array with exactly {n} objects, one per Q/A in order:
+[
+  {{
+    "question": "<exact question text>",
+    "score": <integer 0-100>,
+    "critique": "2-3 sentences. Reference their actual answer. Name specific gaps.",
+    "ideal_answer_snippet": "1-2 sentences on what a strong answer would include."
+  }}
+]
+
+CRITICAL: The array MUST have exactly {n} objects. Do not stop early."""
+
+    raw = chat([{"role": "user", "content": prompt}], temperature=0.2)
+    entries = extract_json_array(raw)
+
+    # Backfill any missing entries (safety net)
+    if len(entries) < n:
+        logger.warning("question_feedback returned %d/%d entries — backfilling remainder", len(entries), n)
+        for i in range(len(entries), n):
+            turn = history[i]
+            quality = _assess_quality(turn.get("answer", ""))
+            entries.append({
+                "question":            turn.get("question", ""),
+                "score":               QUALITY_SCORE.get(quality["label"], 55),
+                "critique":            quality["comment"],
+                "ideal_answer_snippet": quality["ideal"],
+                "answer_quality":      quality["label"],
+                "_backfilled":         True,
+            })
+
+    # Guarantee every entry has required fields
+    for i, entry in enumerate(entries[:n]):
+        entry.setdefault("question", history[i].get("question", "") if i < len(history) else "")
+        entry.setdefault("score", 55)
+        entry.setdefault("critique", "")
+        entry.setdefault("ideal_answer_snippet", "")
+
+    return entries[:n]  # never return more than asked
+
+
+# ── Main entry point ───────────────────────────────────────────────────────────
 
 def generate_feedback(
     resume_data: dict,
     role: str,
     history: list[dict],
-    misbehavior_log: list[dict] | None = None,
+    misbehavior_log: list[dict]    | None = None,
     speech_metrics_log: list[dict] | None = None,
+    is_terminated: bool = False,
 ) -> dict:
-    annotated    = []
-    idk_questions = []
-    rude_answers  = []
+    misbehavior_log    = misbehavior_log    or []
+    speech_metrics_log = speech_metrics_log or []
 
+    annotated, idk_questions = [], []
     for turn in history:
-        q = turn.get("question", "")
-        a = turn.get("answer", "")
-        flags = _detect_issues(a)
+        q, a = turn.get("question",""), turn.get("answer","")
+        flags = detect_issues(a)
         annotated.append({**turn, **flags})
-        if flags["is_idk"]:
-            idk_questions.append(q)
-        if flags["is_rude"]:
-            rude_answers.append({"question": q, "answer": a})
+        if flags["is_idk"]: idk_questions.append(q)
 
-    convo_text = "\n".join(
-        [f"Q{i+1}: {t['question']}\nA{i+1}: {t['answer']}" for i, t in enumerate(annotated)]
-    )
+    convo_text = "\n".join(f"Q{i+1}: {t['question']}\nA{i+1}: {t['answer']}" for i,t in enumerate(annotated)) \
+                 or "(No answers recorded)"
 
-    idk_note = ""
-    if idk_questions:
-        idk_note = (
-            "\n\nNOTED: The candidate said 'I don't know' or gave a non-answer to these questions:\n"
-            + "\n".join(f"- {q}" for q in idk_questions)
-            + "\nFor each, provide a specific 'study_topic' they need to learn thoroughly."
-        )
+    agg = aggregate_speech_metrics(speech_metrics_log)
+    speech_ctx = (
+        f"\nSPEECH: {agg['total_words_spoken']} words | {agg['total_filler_count']} fillers | "
+        f"fluency {agg['avg_fluency_score']}/100 | top fillers: "
+        f"{', '.join(f['word'] for f in agg['top_filler_words'][:4]) or 'none'}"
+    ) if agg else ""
 
-    rude_note = ""
-    if rude_answers:
-        rude_note = (
-            "\n\nNOTED: The candidate was rude or dismissive in these responses:\n"
-            + "\n".join(f"- Q: {r['question']}\n  A: {r['answer']}" for r in rude_answers)
-            + "\nFlag these in 'behavioral_flags'."
-        )
-
-    misbehavior_note = ""
+    strikes_ctx = ""
     if misbehavior_log:
-        strikes = len(misbehavior_log)
-        misbehavior_note = (
-            f"\n\nNOTED: The candidate received {strikes} misbehavior strike(s) during the interview. "
-            "Factor this heavily into communication and behavioral scores. Strikes were: "
-            + "; ".join(f"Strike {m['strike']}: {m['reason']} on Q '{m['question'][:50]}'" for m in misbehavior_log)
-        )
+        strikes_ctx = f"\nSTRIKES: {len(misbehavior_log)} — " + "; ".join(
+            f"Strike {m['strike']}: {m['reason']}" for m in misbehavior_log)
+    if is_terminated:
+        strikes_ctx += "\nINTERVIEW TERMINATED."
 
-    # Summarise speech for the AI prompt
-    speech_summary = ""
-    if speech_metrics_log:
-        agg = _aggregate_speech_metrics(speech_metrics_log)
-        speech_summary = (
-            f"\n\nSPEECH ANALYSIS (from audio transcription):\n"
-            f"- Total words spoken: {agg.get('total_words_spoken', 0)}\n"
-            f"- Total filler word usage: {agg.get('total_filler_count', 0)} times\n"
-            f"- Most used fillers: {', '.join(m['word'] for m in agg.get('top_filler_words', [])[:4]) or 'none'}\n"
-            f"- Repeated/stuttered words: {', '.join(agg.get('repeated_words', [])[:4]) or 'none'}\n"
-            f"- Answers that were too brief: {agg.get('too_short_answers', 0)}\n"
-            f"- Answers that were too long: {agg.get('too_long_answers', 0)}\n"
-            f"- Average fluency score: {agg.get('avg_fluency_score', 0)}/100\n"
-            "Use this to evaluate speech_clarity_score and mention speech patterns in the summary if notable."
-        )
+    # ── Two separate LLM calls ─────────────────────────────────────────────────
+    summary_result   = _call_summary(role, convo_text, speech_ctx, strikes_ctx)
+    question_feedback = _call_question_feedback(role, history)
 
-    prompt = f"""You are an expert, unbiased interview evaluator for the role of {role}.
+    # ── Merge ──────────────────────────────────────────────────────────────────
+    result = {**summary_result, "question_feedback": question_feedback}
 
-Interview transcript:
-{convo_text}
-{idk_note}
-{rude_note}
-{misbehavior_note}
-{speech_summary}
-
-SCORING RULES — FOLLOW STRICTLY:
-- Scores range 0–100. Max realistic: 88. Min realistic: 12.
-- 50 = average. 65 = solid but gaps. 75 = genuinely strong.
-- DO NOT inflate scores. Multiple "I don't know" answers = below 50 in technical_depth.
-- confidence_score: Penalise very short, vague, or "IDK" answers. Also penalise rambling.
-- communication_score: Penalise rude language, deflection, and rambling.
-- technical_depth_score: Penalise "I don't know". Reward correct technical specifics.
-- behaviour_score: 0-100. Professionalism, tone, pushback handling. Rude/dismissive = very low.
-- speech_clarity_score: 0-100. Based on filler word usage, stuttering, answer length appropriateness.
-  100 = no fillers, clear and measured. Deduct 4 per filler usage, 6 per stutter cluster.
-- overall_score: Weighted — technical_depth 30%, confidence 20%, communication 20%, behaviour 15%, speech_clarity 15%.
-
-Return ONLY a valid JSON object (no markdown fences):
-{{
-  "overall_score": <integer>,
-  "confidence_score": <integer>,
-  "clarity_score": <integer>,
-  "technical_depth_score": <integer>,
-  "communication_score": <integer>,
-  "behaviour_score": <integer>,
-  "speech_clarity_score": <integer>,
-  "summary": "2-3 sentences: honest, direct summary",
-  "speech_summary": "1-2 sentences: honest assessment of how clearly they spoke, mention filler words or stuttering if present",
-  "confidence_calibration": "under-confident | balanced | over-confident",
-  "confidence_note": "1 sentence explaining the confidence calibration",
-  "strengths": ["strength 1", "strength 2"],
-  "improvements": ["specific area 1", "specific area 2", "specific area 3"],
-  "behavioral_flags": [
-    {{
-      "type": "rude | dismissive | over-confident | evasive | idk",
-      "question": "the question",
-      "note": "what they said and why it's a problem"
-    }}
-  ],
-  "question_feedback": [
-    {{
-      "question": "the question",
-      "answer_quality": "strong | good | average | weak | blank",
-      "answer_summary": "1 sentence: what they actually said",
-      "comment": "specific honest feedback",
-      "what_you_should_have_said": "ideal answer approach in 2-3 sentences",
-      "ideal_points": ["key point 1", "key point 2"],
-      "study_topic": null
-    }}
-  ],
-  "recommended_topics": [
-    {{
-      "topic": "Topic Name",
-      "reason": "Why they need to study this",
-      "priority": "high | medium"
-    }}
-  ]
-}}
-
-For any question where the candidate said 'I don't know':
-- Set answer_quality to "blank" or "weak"
-- Set study_topic to the concept they should study
-- Add that topic to recommended_topics with priority "high"
-
-Return ONLY the JSON. No preamble.
-"""
-
-    response = chat(
-        [{"role": "user", "content": prompt}],
-        temperature=0.25,
+    # ── Compute scores ─────────────────────────────────────────────────────────
+    scores = compute_scores(
+        qf            = question_feedback,
+        speech_log    = speech_metrics_log,
+        misbehavior   = misbehavior_log,
+        is_terminated = is_terminated,
+        idk_qs        = idk_questions,
     )
+    result.update(scores)
 
-    clean = response.strip()
-    if clean.startswith("```"):
-        clean = clean.split("```")[1]
-        if clean.startswith("json"):
-            clean = clean[4:]
-    clean = clean.strip()
+    # ── IDK backfill into learning_path ───────────────────────────────────────
+    existing_topics = {t["topic"].lower() for t in result.get("learning_path", [])}
+    for q in idk_questions:
+        if not any(q[:30].lower() in t for t in existing_topics):
+            result.setdefault("learning_path", []).append({
+                "topic":    q[:80],
+                "reason":   "Candidate had no answer for this question",
+                "priority": "High",
+            })
 
-    try:
-        result = json.loads(clean)
+    # ── Attach speech analysis ─────────────────────────────────────────────────
+    if agg:
+        result["speech_analysis"] = agg
 
-        # Back-fill idk topics if AI missed them
-        existing_topics = {t["topic"].lower() for t in result.get("recommended_topics", [])}
-        for q in idk_questions:
-            topic_key = q[:40].lower()
-            if not any(topic_key in t for t in existing_topics):
-                result.setdefault("recommended_topics", []).append({
-                    "topic": q[:80],
-                    "reason": "Candidate said 'I don't know' when asked this question",
-                    "priority": "high",
-                })
-
-        # Attach aggregated speech metrics to the result
-        if speech_metrics_log:
-            result["speech_analysis"] = _aggregate_speech_metrics(speech_metrics_log)
-
-        return result
-
-    except json.JSONDecodeError:
-        return {
-            "error": "Could not parse feedback",
-            "raw": response,
-            "overall_score": 0,
-        }
+    return result
