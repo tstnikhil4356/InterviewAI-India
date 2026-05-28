@@ -1,12 +1,8 @@
 """
-interview.py — Fixed & Enhanced v2
+interview.py — Fixed & Enhanced v3
 Fixes:
-  1. Session persistence to disk (survives dev-server restarts → no more 404)
-  2. misbehavior_count properly wired into generate_follow_up
-  3. terminated flag propagated to frontend
-  4. Speech metrics tracked per answer (filler words, word count, fluency)
-  5. Report returns misbehavior_count, terminated, speech_metrics
-  6. Quality assessment now discriminative (not all 55s)
+  1. Solved the "previous-to-previous" question bug by passing the full `session["history"]`
+     to `generate_follow_up` without stripping the last element (`[:-1]`).
 """
 
 import json
@@ -188,7 +184,7 @@ async def start_interview(
 
     return {
         "session_id": session_id,
-        "question": first_question,         # included so frontend can skip the /session GET
+        "question": first_question,
         "question_number": 1,
     }
 
@@ -213,7 +209,7 @@ async def next_question(body: NextQuestionRequest):
         "metrics": speech,
     })
 
-    # Save answer to history with speech metrics
+    # Save current answer to history
     session["history"].append({
         "question": session["current_question"],
         "answer": body.transcript,
@@ -223,12 +219,13 @@ async def next_question(body: NextQuestionRequest):
 
     misbehavior_count: int = session.get("misbehavior_count", 0)
 
+    # FIXED: We now pass the FULL history (without [:-1]) so the engine
+    # knows exactly which question was just answered.
     result = generate_follow_up(
         resume_data=session["resume_data"],
         role=session["role"],
         level=session["level"],
-        history=session["history"][:-1],
-        last_answer=body.transcript,
+        history=session["history"],
         misbehavior_count=misbehavior_count,
     )
 
@@ -276,7 +273,7 @@ async def next_question(body: NextQuestionRequest):
             "strike": new_strike_count,
         })
         strike_issued = True
-        print(f"[STRIKE] {new_strike_count}/3 — answer was {answer_quality}")
+        print(f"[STRIKE] {new_strike_count}/4 — answer was {answer_quality}")
 
     reaction = result.get("reaction", "")
     next_q   = result.get("question", "")
@@ -401,8 +398,7 @@ async def get_report(session_id: str):
     session = get_session(session_id)
     is_terminated = session.get("terminated", False)
 
-    # If terminated with zero history (kicked out on Q1 before submitting any answer),
-    # return a minimal report instead of a 400 — so the frontend always gets a renderable page.
+    # If terminated with zero history (kicked out on Q1 before submitting any answer)
     if not session["history"]:
         if is_terminated:
             return {

@@ -17,7 +17,7 @@ def _get_client() -> Groq:
     return Groq(api_key=api_key)
 
 
-LLM_MODEL     = "llama-3.3-70b-versatile"
+LLM_MODEL     = "llama-3.3-70b-versatile" # "llama-3.3-70b-versatile"
 WHISPER_MODEL = "whisper-large-v3"
 TTS_MODEL     = "playai-tts"
 

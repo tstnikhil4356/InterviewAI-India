@@ -1,67 +1,62 @@
 """
-question_engine.py — v7
+question_engine.py — v10
 
-Interviewer quality improvements:
-  1. SYSTEM_PROMPT — adaptive tone, not just "cold and dominant"
-  2. generate_first_question — varied openers based on resume type
-  3. generate_follow_up — cleaner prompt, no leaked internals, richer directives
-  4. pick_next_target — specific question angles per section type
-  5. should_end — removed extra LLM call, replaced with deterministic logic
-  6. Question variety enforcement — banned question patterns, angle rotation
-  7. vague handling — gives a pointed recovery question, not a dead-end demand
+Fixes:
+  1. Randomized Targeting: The interviewer no longer strictly exhausts all projects
+     and experiences before asking about skills. It now picks randomly from all
+     uncovered topics, naturally weaving direct skill scenario questions in between
+     projects and internships.
+  2. Deeper Skill Probing: If all topics are covered, the AI can now circle back
+     to directly probe a skill with a complex edge-case scenario.
 """
 
 import random
 from app.services.groq_client import chat
 
-MAX_QUESTIONS   = 10
-MIN_QUESTIONS   = 6
-MAX_MISBEHAVIOR = 3
+MAX_QUESTIONS   = 12
+MIN_QUESTIONS   = 8
+MAX_MISBEHAVIOR = 4
 
 # ── Interviewer persona ────────────────────────────────────────────────────────
 
 SYSTEM_PROMPT = """You are a senior technical interviewer with 15 years of engineering experience.
-You are direct, exacting, and not easily impressed — but you are also fair and precise.
+You are direct, exacting, and fair. You speak naturally and conversationally, not like a robot.
 
 TONE BY SITUATION:
-- Strong answer → acknowledge in 2-4 words, then immediately go deeper: "Right. Now explain why you chose X over Y."
-- Partial answer → identify exactly what's missing, ask for it: "You mentioned X. What was the actual impact?"
-- Vague answer → call out what's missing specifically: "That tells me nothing about your role. What did YOU build?"
-- Wrong answer → correct it directly, don't soften: "That's not accurate. [correct fact]. Given that, how would you approach it?"
-- Nervous/rambling → cut it: "Stop. One sentence: what was the outcome?"
+- Strong answer -> Provide a natural, conversational acknowledgment (e.g., "Got it, that makes sense." or "Understood, that clears it up."), then immediately go deeper.
+- Partial answer -> identify exactly what's missing naturally: "You mentioned X, but what was the actual impact?"
+- Vague answer -> call out what's missing specifically: "That tells me about the team, but what did YOU build?"
+- Wrong answer -> correct it directly but professionally: "Actually, [correct fact]. Given that, how would you approach it?"
+- Nervous/rambling -> cut it gently but firmly: "Let's pause there. In one sentence, what was the outcome?"
 
 BANNED PHRASES — never use these:
 - "great", "good job", "interesting", "I see", "perfect", "absolutely"
 - "Tell me about yourself" (too generic)
 - "Can you walk me through" (use direct questions instead)
-- Any variation of "That's a good point"
 
 QUESTION STYLE:
-- Ask exactly one question per turn
-- Questions must be specific to what the candidate actually said or what's on their resume
-- Prefer: "How did you handle X when Y happened?" over "Tell me about X"
-- Prefer: "What was the latency before and after your optimization?" over "How did that go?"
-- For projects: ask about decisions, trade-offs, failures, specific numbers
-- For experience: ask about scope, ownership, what broke, what they'd do differently
-- For skills: test understanding with a scenario, not a definition
+- Ask exactly one question per turn.
+- Questions must be specific to what the candidate actually said or what's on their resume.
+- For projects: ask about decisions, trade-offs, failures, specific numbers.
+- For experience: ask about scope, ownership, what broke, what they'd do differently.
+- For skills: NEVER ask for a textbook definition. Give them a scenario, edge-case, or trade-off to solve.
 
 FORMAT — always exactly two lines:
-REACTION: [your response to their last answer — 1 sentence, direct]
+REACTION: [your conversational but brief reaction to their last answer — 1 natural sentence]
 QUESTION: [your next question — 1-2 sentences, specific]"""
 
 
 STRIKE_WARNINGS = [
-    "That's a warning. One more answer like that and this interview ends.",
-    "Second warning. I need real answers or we stop here.",
+    "That's a warning. I need a clear technical answer.",
+    "Second warning. Please engage directly with the question.",
+    "Third warning. One more answer like that and this interview ends.",
 ]
 
 TERMINATION_MESSAGES = [
-    "Three strikes. This interview is over. Come back when you're prepared to engage seriously.",
     "I've heard enough. We're done — this isn't the level we need.",
     "Interview terminated. Your answers don't meet the bar for this role.",
 ]
 
-# Question angle rotation — prevents "tell me about X" every time
 PROJECT_ANGLES = [
     "What was the hardest technical decision you made on {name}, and what did you consider before choosing?",
     "What broke in {name}, and how did you debug it?",
@@ -88,15 +83,60 @@ BEHAVIORAL_ANGLES = [
 ]
 
 
+# ── Topic detection ────────────────────────────────────────────────────────────
+
+def _detect_topic(question: str, resume_data: dict) -> str:
+    q = question.lower()
+
+    for p in resume_data.get("projects", []):
+        name = (p.get("name") or "").lower()
+        desc = (p.get("description") or "").lower()
+        keywords = [w for w in (name + " " + desc).split() if len(w) > 3][:8]
+        if name and (name in q or any(kw in q for kw in keywords)):
+            return f"Project: {p.get('name', '?')}"
+
+    for e in resume_data.get("experience", []):
+        company = (e.get("company") or "").lower()
+        role    = (e.get("role") or "").lower()
+        if company and (company in q or role in q):
+            return f"Experience: {e.get('role')} at {e.get('company')}"
+
+    behavioral_kws = ["conflict", "failure", "challenge", "mistake", "disagree",
+                      "pressure", "deadline", "difficult", "wrong", "stressful"]
+    if any(kw in q for kw in behavioral_kws):
+        return "Behavioral"
+
+    skill_kws = ["python", "react", "sql", "docker", "aws", "ml", "ai", "llm",
+                 "pytorch", "tensorflow", "api", "database", "cloud"]
+    if any(kw in q for kw in skill_kws):
+        return "Skills"
+
+    return "General"
+
+
+def _consecutive_topic(history: list[dict], resume_data: dict) -> tuple[str, int]:
+    if not history:
+        return ("", 0)
+
+    topics = [_detect_topic(h["question"], resume_data) for h in history]
+    last_topic = topics[-1]
+    count = 0
+    for t in reversed(topics):
+        if t == last_topic:
+            count += 1
+        else:
+            break
+    return (last_topic, count)
+
+
 # ── First question ─────────────────────────────────────────────────────────────
 
 def generate_first_question(resume_data: dict, role: str, level: str) -> str:
     resume_summary = summarize_resume(resume_data)
 
-    # Pick opener angle based on what's most prominent on the resume
-    has_projects    = bool(resume_data.get("projects"))
-    has_experience  = bool(resume_data.get("experience"))
-    name            = resume_data.get("name", "").split()[0] if resume_data.get("name") else ""
+    has_projects   = bool(resume_data.get("projects"))
+    has_experience = bool(resume_data.get("experience"))
+    name           = resume_data.get("name", "").split()[0] if resume_data.get("name") else ""
 
     if has_experience:
         opener_instruction = "Ask them to introduce themselves in under 60 seconds — name, most recent role, and one technical thing they're most proud of. No life story."
@@ -136,15 +176,17 @@ def generate_follow_up(
     role: str,
     level: str,
     history: list[dict],
-    last_answer: str,
     misbehavior_count: int = 0,
 ) -> dict | None:
-    questions_asked = len(history) + 1
+    questions_asked = len(history)
 
-    if questions_asked > MAX_QUESTIONS:
+    if questions_asked >= MAX_QUESTIONS:
         return None
 
-    last_question  = history[-1]["question"] if history else ""
+    current_turn = history[-1]
+    last_question = current_turn["question"]
+    last_answer = current_turn["answer"]
+
     answer_quality = assess_answer(last_answer, last_question)
     is_misbehavior = answer_quality in ("gibberish", "evasive")
 
@@ -162,45 +204,58 @@ def generate_follow_up(
     if is_misbehavior and misbehavior_count < MAX_MISBEHAVIOR - 1:
         strike_warning = STRIKE_WARNINGS[min(misbehavior_count, len(STRIKE_WARNINGS) - 1)]
 
-    # ── Natural end (deterministic — no extra LLM call) ───────────────────────
-    if questions_asked > MIN_QUESTIONS and not is_misbehavior:
+    # ── Natural end (deterministic) ───────────────────────────────────────────
+    if questions_asked >= MIN_QUESTIONS and not is_misbehavior:
         if _should_end_deterministic(resume_data, history):
             return None
 
+    # ── Topic-loop detection ──────────────────────────────────────────────────
+    last_topic, consecutive_count = _consecutive_topic(history, resume_data)
+    force_topic_change = (consecutive_count >= 2)
+
     # ── Coverage + next target ────────────────────────────────────────────────
     coverage    = build_coverage(resume_data, history)
-    next_target = pick_next_target(coverage, questions_asked, history, resume_data)
+    next_target = pick_next_target(
+        coverage         = coverage,
+        questions_asked  = questions_asked,
+        history          = history,
+        resume_data      = resume_data,
+        force_skip_label = last_topic if force_topic_change else None,
+    )
 
     resume_summary = summarize_resume(resume_data)
 
-    # Build clean conversation — no internal labels leaked to LLM
     convo_lines = []
     for i, h in enumerate(history):
         convo_lines.append(f"Q{i+1}: {h['question']}")
         convo_lines.append(f"A{i+1}: {h['answer']}")
-    convo_lines.append(f"Latest answer: {last_answer}")
     convo = "\n".join(convo_lines)
 
-    # ── Reaction directive ────────────────────────────────────────────────────
+    # ── Reaction + question directives ────────────────────────────────────────
     if answer_quality == "gibberish":
-        reaction_directive = f'REACTION must be: "{strike_warning} That answer made no sense."'
-        question_directive = f"Repeat the previous question ({last_question[:80]}), rephrased more pointedly."
+        reaction_directive = f'REACTION must be: "{strike_warning} I could not understand that answer."'
+        question_directive = f"Repeat the previous question ({last_question[:80]}), asking them to clarify."
+
     elif answer_quality == "evasive":
         reaction_directive = f'REACTION must be: "{strike_warning} You didn\'t answer the question."'
         question_directive = f"Ask the same question again ({last_question[:80]}) from a different angle. Make clear you expect a direct answer."
-    elif answer_quality == "vague":
-        reaction_directive = "REACTION: Point out exactly what was generic. E.g. 'You said you improved performance — by how much, using what?'"
-        question_directive = (
-            f"Ask a razor-sharp follow-up that forces specificity on their last answer. "
-            f"Pick the single vaguest claim they made and demand the concrete detail behind it. "
-            f"If they can't recover, next question will move on."
-        )
-    else:
-        reaction_directive = "REACTION: Acknowledge in 2-4 words max, then optionally note one gap."
-        question_directive = f"Next question: {next_target['instruction']}"
 
-    # Enforce question variety — tell LLM what angle to take
+    elif answer_quality == "vague" and not force_topic_change:
+        reaction_directive = "REACTION: Politely point out exactly what was generic. E.g. 'You mentioned improving performance, but by how much?'"
+        question_directive = (
+            "Ask a razor-sharp follow-up that forces specificity on their last answer. "
+            "Pick the single vaguest claim they made and demand the concrete detail behind it."
+        )
+
+    else:
+        if force_topic_change and answer_quality == "vague":
+            reaction_directive = "REACTION: Note that the answer was still a bit generic, then gracefully move on to the next topic."
+        else:
+            reaction_directive = "REACTION: Acknowledge naturally in a brief conversational sentence (e.g., 'Got it, that clarifies things.'), then optionally note one gap."
+        question_directive = f"Next question (NEW TOPIC — do NOT reference what was just discussed): {next_target['instruction']}"
+
     already_asked_types = _extract_question_patterns(history)
+    recent_questions_summary = " | ".join(h["question"][:60] for h in history[-3:]) if history else "none"
 
     prompt = f"""Interviewing: {role} ({level})
 
@@ -216,13 +271,14 @@ Conversation:
 {question_directive}
 
 Already asked about: {', '.join(already_asked_types) if already_asked_types else 'nothing yet'}
+Recent questions (DO NOT repeat or rephrase these): {recent_questions_summary}
 {"Strike warning to include verbatim: " + strike_warning if strike_warning else ""}
+{"⚠ MANDATORY TOPIC SWITCH: Ask about a completely different part of their resume." if force_topic_change else ""}
 
 RULES:
-- REACTION: 1 sentence maximum. No filler. No praise.
-- QUESTION: 1-2 sentences. Specific. Reference something real from their resume or their answer.
-- Do NOT ask "tell me about X" — ask what specifically happened, what they decided, what the result was.
-- Do NOT ask anything already in the "Already asked" list.
+- REACTION: 1 natural, conversational sentence. No filler, but don't be robotic.
+- QUESTION: 1-2 sentences. Specific. Reference something real from their resume.
+- Do NOT ask anything already in the "Already asked" list or similar to the recent questions listed above.
 
 REACTION: [your reaction]
 QUESTION: [your question]"""
@@ -234,8 +290,9 @@ QUESTION: [your question]"""
     )
 
     parsed = parse_response(result)
-    parsed["terminated"]     = False
-    parsed["answer_quality"] = answer_quality
+    parsed["terminated"]      = False
+    parsed["answer_quality"]  = answer_quality
+    parsed["force_topic_change"] = force_topic_change
     return parsed
 
 
@@ -245,24 +302,22 @@ def assess_answer(answer: str, question: str) -> str:
     if not answer or len(answer.strip()) < 6:
         return "gibberish"
 
-    prompt = f"""Rate this interview answer.
+    prompt = f"""Rate this spoken interview answer.
 
 Question: {question}
 Answer: {answer}
 
+NOTE: This is a speech-to-text transcript. You MUST ignore typos, grammatical errors, stuttering, and transcript artifacts.
+
 Pick exactly ONE:
 
-gibberish — Nonsense, random text, completely off-topic, or a joke. Examples: "asdf lol", "I like pizza", "!!!"
+gibberish — 100% complete nonsense or completely unrelated random text. Do NOT use this for poor, incorrect, or incomplete answers.
+evasive — Deliberate refusal to engage. Examples: "I don't want to answer", "why are you asking this". 
+NOT evasive: admitting "I don't know" while attempting to answer.
+vague — Attempted to answer but used only contentless generic buzzwords. No specific tools, numbers, or personal actions described.
+ok — Made a genuine attempt with at least one concrete element (a specific tool, metric, action, scenario), OR demonstrated conceptual understanding even if imperfect.
 
-evasive — Deliberate refusal to engage. Examples: "I don't want to answer", "next question please", "why are you asking this"
-NOT evasive: admitting "I don't know" while attempting to answer, or showing unfamiliarity with a topic.
-
-vague — Attempted to answer but every statement is a contentless generic claim. No tool names, no numbers, no personal role described, no concrete example. Pure buzzwords only.
-Example: "I worked on machine learning and improved the model performance using Python."
-NOT vague if they mentioned: any specific library, any number/metric, their specific role/action, any concrete scenario.
-
-ok — Made a genuine attempt with at least one concrete element: a specific tool, a metric, a personal action, a real scenario, or demonstrated conceptual understanding even if imperfect.
-When in doubt between ok and vague → choose ok.
+When in doubt between ok, vague, and gibberish -> choose ok.
 
 One word only: gibberish, evasive, vague, or ok"""
 
@@ -319,81 +374,104 @@ def build_coverage(resume_data: dict, history: list[dict]) -> dict:
     }
 
 
-def pick_next_target(coverage: dict, questions_asked: int, history: list[dict], resume_data: dict) -> dict:
+def pick_next_target(
+    coverage: dict,
+    questions_asked: int,
+    history: list[dict],
+    resume_data: dict,
+    force_skip_label: str | None = None,
+) -> dict:
+    """
+    Picks the next interview target by randomly selecting from all UNCOVERED topics.
+    This ensures skills, projects, and experiences are dynamically mixed.
+    """
     uncovered = coverage["uncovered"]
 
-    # Closing stretch
+    def _skip(item: dict) -> bool:
+        if not force_skip_label:
+            return False
+        return item["label"] == force_skip_label or item["label"].startswith(force_skip_label)
+
+    # 1. Closing stretch check (Always reserve for the very end)
     if questions_asked >= MAX_QUESTIONS - 1:
-        beh = next((u for u in uncovered if u["type"] == "behavioral"), None)
+        beh = next((u for u in uncovered if u["type"] == "behavioral" and not _skip(u)), None)
         if beh:
             return {"label": "Behavioral", "instruction": random.choice(BEHAVIORAL_ANGLES)}
         return {"label": "Closing", "instruction": "Ask why they want this specific role and what they'd contribute in the first 90 days."}
 
-    # Projects first — most signal-rich
-    proj = next((u for u in uncovered if u["type"] == "project"), None)
-    if proj:
-        p = proj["data"]
-        name = p.get("name", "this project")
-        angle = random.choice(PROJECT_ANGLES).format(name=name)
-        return {"label": proj["label"], "instruction": angle}
+    # 2. Gather all valid uncovered targets and pick one randomly to ensure variety
+    valid_targets = [u for u in uncovered if not _skip(u)]
 
-    # Experience next
-    exp = next((u for u in uncovered if u["type"] == "experience"), None)
-    if exp:
-        e = exp["data"]
-        company = e.get("company", "this company")
-        angle = random.choice(EXPERIENCE_ANGLES).format(company=company)
-        return {"label": exp["label"], "instruction": angle}
+    if valid_targets:
+        target = random.choice(valid_targets)
 
-    # Skills
-    skill = next((u for u in uncovered if u["type"] == "skill"), None)
-    if skill:
-        skills_list = skill["data"][:3] if isinstance(skill["data"], list) else []
-        skill_str = ", ".join(skills_list) if skills_list else skill["label"]
-        return {
-            "label": skill["label"],
-            "instruction": f"Test practical understanding of {skill_str} — give them a real scenario or edge case, not a definition question.",
-        }
+        if target["type"] == "project":
+            p = target["data"]
+            name = p.get("name", "this project")
+            angle = random.choice(PROJECT_ANGLES).format(name=name)
+            return {"label": target["label"], "instruction": angle}
 
-    # Behavioral
-    beh = next((u for u in uncovered if u["type"] == "behavioral"), None)
-    if beh:
-        return {"label": "Behavioral", "instruction": random.choice(BEHAVIORAL_ANGLES)}
+        elif target["type"] == "experience":
+            e = target["data"]
+            company = e.get("company", "this company")
+            angle = random.choice(EXPERIENCE_ANGLES).format(company=company)
+            return {"label": target["label"], "instruction": angle}
 
-    # Everything covered — go deeper
-    if questions_asked < MIN_QUESTIONS:
-        last_q = history[-1]["question"] if history else ""
-        last_a = history[-1]["answer"] if history else ""
-        return {
-            "label": "Technical depth",
-            "instruction": f"The candidate mentioned something in their last answer. Pick the most technically interesting claim and probe deeper — ask for the specific implementation detail, the failure case, or the scale.",
-        }
+        elif target["type"] == "skill":
+            skills_list = target["data"][:3] if isinstance(target["data"], list) else []
+            skill_str = ", ".join(skills_list) if skills_list else target["label"]
+            return {
+                "label": target["label"],
+                "instruction": f"Test practical understanding of {skill_str} by providing a real-world engineering scenario, architectural trade-off, or edge case for them to solve. Do NOT ask for textbook definitions."
+            }
 
+        elif target["type"] == "behavioral":
+            return {"label": "Behavioral", "instruction": random.choice(BEHAVIORAL_ANGLES)}
+
+    # 3. If everything is covered but we haven't reached MIN_QUESTIONS, go deeper randomly
+    covered = coverage["covered"]
+    valid_covered = [c for c in covered if not _skip(c) and c["type"] in ("project", "experience", "skill")]
+
+    if valid_covered and questions_asked < MIN_QUESTIONS:
+        target = random.choice(valid_covered)
+
+        if target["type"] == "project":
+            p = target["data"]
+            name = p.get("name", "this project")
+            angle = random.choice(PROJECT_ANGLES).format(name=name)
+            return {"label": target["label"], "instruction": f"Go deeper on {name}: {angle}"}
+
+        elif target["type"] == "experience":
+            e = target["data"]
+            company = e.get("company", "this company")
+            angle = random.choice(EXPERIENCE_ANGLES).format(company=company)
+            return {"label": target["label"], "instruction": f"Go deeper on their time at {company}: {angle}"}
+
+        elif target["type"] == "skill":
+            skills_list = target["data"][:3] if isinstance(target["data"], list) else []
+            skill_str = ", ".join(skills_list) if skills_list else target["label"]
+            return {
+                "label": target["label"],
+                "instruction": f"Go deeper on {skill_str}. Present a highly complex edge case or scaling problem and ask how they would handle it."
+            }
+
+    # 4. Fallback Closing
     return {"label": "Closing", "instruction": "Wrap up — ask what excites them most about this role and what they'd want to learn."}
 
 
-# ── Deterministic end check (replaces extra LLM call) ─────────────────────────
+# ── Deterministic end check ────────────────────────────────────────────────────
 
 def _should_end_deterministic(resume_data: dict, history: list[dict]) -> bool:
-    """
-    Ends the interview when:
-    - All projects and experiences have been covered, AND
-    - At least one behavioral question was asked, AND
-    - MIN_QUESTIONS have been asked
-    No LLM call needed.
-    """
     if len(history) < MIN_QUESTIONS:
         return False
 
     coverage  = build_coverage(resume_data, history)
     uncovered = coverage["uncovered_labels"]
 
-    # Must have covered all projects and experiences
     hard_uncovered = [u for u in uncovered if not u.startswith("Skills:") and u != "Behavioral"]
     if hard_uncovered:
         return False
 
-    # Must have done behavioral
     if "Behavioral" in uncovered:
         return False
 
@@ -403,10 +481,6 @@ def _should_end_deterministic(resume_data: dict, history: list[dict]) -> bool:
 # ── Question variety helpers ───────────────────────────────────────────────────
 
 def _extract_question_patterns(history: list[dict]) -> list[str]:
-    """
-    Extracts high-level patterns from asked questions to prevent repetition.
-    Returns a short list of what's already been covered in terms of question type.
-    """
     patterns = []
     for h in history:
         q = h["question"].lower()
