@@ -285,7 +285,7 @@ export default function HomePage() {
             </div>
             <span className="text-white font-medium text-sm">interviewai</span>
           </div>
-          <p className="text-gray-600 text-xs">© {new Date().getFullYear()} InterviewAI. Built for India's placement season.</p>
+          <p className="text-gray-600 text-xs">© {new Date().getFullYear()} InterviewAI. Built for India&apos;s placement season.</p>
           <div className="flex gap-4 text-xs text-gray-600">
             <Link href="#" className="hover:text-gray-400 transition-colors">Privacy</Link>
             <Link href="#" className="hover:text-gray-400 transition-colors">Terms</Link>

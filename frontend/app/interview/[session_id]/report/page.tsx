@@ -322,7 +322,7 @@ export default function ReportPage() {
         {data.terminated && (
           <div style={{ marginBottom: 24, padding: "16px 22px", background: "rgba(239,68,68,0.06)", border: "1px solid rgba(239,68,68,0.2)", borderRadius: 14 }}>
             <p style={{ fontSize: 13, fontWeight: 700, color: "#fca5a5", marginBottom: 4 }}>Interview Terminated</p>
-            <p style={{ fontSize: 13, color: "rgba(255,255,255,0.4)", fontStyle: "italic" }}>"{data.termination_message}"</p>
+            <p style={{ fontSize: 13, color: "rgba(255,255,255,0.4)", fontStyle: "italic" }}>&quot;{data.termination_message}&quot;</p>
           </div>
         )}
 
@@ -510,7 +510,7 @@ export default function ReportPage() {
                       {q.question}
                     </p>
                     {answerSummary && (
-                      <p style={{ fontSize: 12, color: "rgba(255,255,255,0.32)", lineHeight: 1.5, fontStyle: "italic" }}>"{answerSummary}"</p>
+                      <p style={{ fontSize: 12, color: "rgba(255,255,255,0.32)", lineHeight: 1.5, fontStyle: "italic" }}>&quot;{answerSummary}&quot;</p>
                     )}
                   </div>
                   {/* Fluency mini bar */}
@@ -643,7 +643,7 @@ export default function ReportPage() {
                 <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                   {fb.speech_analysis.top_filler_words.map((fw, i) => (
                     <span key={i} style={{ fontSize: 12, padding: "5px 14px", background: "rgba(249,115,22,0.08)", border: "1px solid rgba(249,115,22,0.2)", borderRadius: 20, color: "#f97316", fontFamily: "'DM Mono', monospace" }}>
-                      "{fw.word}" ×{fw.count}
+                      &quot;{fw.word}&quot; ×{fw.count}
                     </span>
                   ))}
                 </div>
@@ -677,7 +677,7 @@ export default function ReportPage() {
                 <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
                   <span style={{ fontSize: 9, padding: "2px 9px", background: "rgba(248,113,113,0.12)", borderRadius: 20, color: "#fca5a5", textTransform: "uppercase", fontWeight: 700, letterSpacing: "0.08em" }}>{flag.type}</span>
                 </div>
-                <p style={{ fontSize: 12, color: "rgba(255,255,255,0.4)", marginBottom: 6, fontStyle: "italic" }}>"{flag.question}"</p>
+                <p style={{ fontSize: 12, color: "rgba(255,255,255,0.4)", marginBottom: 6, fontStyle: "italic" }}>&quot;{flag.question}&quot;</p>
                 <p style={{ fontSize: 13, color: "rgba(255,255,255,0.6)", lineHeight: 1.6 }}>{flag.note}</p>
               </div>
             ))}

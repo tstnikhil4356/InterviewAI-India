@@ -45,6 +45,7 @@ export default function InterviewRoomPage() {
   const [strikeCount, setStrikeCount]   = useState(0);
   const [strikeMsg, setStrikeMsg]       = useState<string | null>(null);
   const [termMsg, setTermMsg]           = useState("");
+  const [pendingCheatAudio, setPendingCheatAudio] = useState<string | null>(null);
 
   // ── Anti-Cheat / Screen Lock State ──
   const [isLockedOut, setIsLockedOut]   = useState(false);
@@ -88,67 +89,21 @@ export default function InterviewRoomPage() {
     });
   }, []);
 
-  const stopAudio = useCallback(() => {
-    if (currentAudioRef.current) {
-      currentAudioRef.current.pause();
-      currentAudioRef.current = null;
-    }
-    if (audioResolveRef.current) {
-      audioResolveRef.current(); // Resolve promise so the app doesn't hang
-      audioResolveRef.current = null;
-    }
-  }, []);
-
   const fetchAndPlay = useCallback(async (text: string): Promise<void> => {
     try {
       const res = await fetch(`${API}/api/interview/speak`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ text }),
+        body: JSON.stringify({ session_id, text }),
       });
-      if (!res.ok) return;
-      const data = await res.json();
-      if (data.audio_b64) await playAudio(data.audio_b64);
-    } catch (err) { logErr("fetchAndPlay", err); }
-  }, [playAudio]);
-
-  // ── Recording ─────────────────────────────────────────────────────────────
-  const startRecording = useCallback(async () => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      streamRef.current = stream;
-      chunksRef.current = [];
-
-      const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-      if (SR) {
-        const rec = new SR();
-        rec.continuous = true;
-        rec.interimResults = true;
-        rec.lang = "en-IN";
-        let final = "";
-        rec.onresult = (e: SpeechRecognitionEvent) => {
-          let interim = "";
-          for (let i = e.resultIndex; i < e.results.length; i++) {
-            const t = e.results[i][0].transcript;
-            if (e.results[i].isFinal) final += t + " ";
-            else interim = t;
-          }
-          setTranscript(final + interim);
-        };
-        rec.start();
-        recognitionRef.current = rec;
-      }
-
-      const mr = new MediaRecorder(stream, { mimeType: "audio/webm" });
-      mediaRecorderRef.current = mr;
-      mr.ondataavailable = (e) => { if (e.data.size > 0) chunksRef.current.push(e.data); };
-      mr.start(250);
-      setPhase("recording");
+      if (!res.ok) throw new Error(`speak ${res.status}`);
+      const { audio_b64 } = await res.json();
+      if (audio_b64) await playAudio(audio_b64);
     } catch (err) {
-      logErr("getUserMedia", err);
-      toast.error("Microphone access denied.");
+      logErr("fetchAndPlay", err);
+      toast.error("Failed to play TTS audio.");
     }
-  }, []);
+  }, [session_id, playAudio]);
 
   const stopRecorder = useCallback((): Promise<Blob> => {
     return new Promise((resolve) => {
@@ -160,6 +115,55 @@ export default function InterviewRoomPage() {
       streamRef.current?.getTracks().forEach((t) => t.stop());
     });
   }, []);
+
+  const startRecording = useCallback(async (): Promise<void> => {
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      streamRef.current = stream;
+      chunksRef.current = [];
+
+      const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+      if (SR) {
+        const rec = new SR();
+        rec.continuous = true;
+        rec.interimResults = true;
+        rec.lang = "en-IN";
+        let finalTranscript = "";
+        rec.onresult = (e: any) => {
+          let interim = "";
+          for (let i = e.resultIndex; i < e.results.length; i++) {
+            const t = e.results[i][0].transcript;
+            if (e.results[i].isFinal) finalTranscript += t + " ";
+            else interim = t;
+          }
+          setTranscript(finalTranscript + interim);
+        };
+        rec.start();
+        recognitionRef.current = rec;
+      }
+
+      const mr = new MediaRecorder(stream, { mimeType: "audio/webm" });
+      mediaRecorderRef.current = mr;
+      mr.ondataavailable = (e) => { if (e.data.size > 0) chunksRef.current.push(e.data); };
+      mr.start(250);
+      setPhase("recording");
+    } catch (err) {
+      logErr("startRecording", err);
+      toast.error("Microphone access denied.");
+    }
+  }, []);
+
+  const stopEverything = useCallback(async (): Promise<void> => {
+    if (currentAudioRef.current) {
+      currentAudioRef.current.pause();
+      currentAudioRef.current = null;
+    }
+    if (audioResolveRef.current) {
+      audioResolveRef.current();
+      audioResolveRef.current = null;
+    }
+    await stopRecorder();
+  }, [stopRecorder]);
 
   const transcribeBlob = useCallback(async (blob: Blob): Promise<string> => {
     const fd = new FormData();
@@ -232,34 +236,45 @@ export default function InterviewRoomPage() {
 
     if (isLockedOut) return;
 
-    // Immediately mute AI voice if they try to cheat while it's speaking
-    stopAudio();
-
-    setCheatCount((prev) => {
-      const newCount = prev + 1;
-
-      if (newCount >= 3) {
-        const reasonStr = "Interview automatically terminated due to multiple tab switches or exiting full-screen.";
-        setTermMsg(reasonStr);
-        setPhase("terminated");
-        if (document.fullscreenElement) document.exitFullscreen();
-
-        // Notify backend to end the session early and provide the reason!
-        fetch(`${API}/api/interview/end`, {
+    setIsLockedOut(true);
+    void stopEverything().then(async () => {
+      try {
+        const res = await fetch(`${API}/api/interview/cheat`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            session_id,
-            reason: reasonStr
-          })
-        }).catch(() => {});
+          body: JSON.stringify({ session_id }),
+        });
 
-      } else {
-        setIsLockedOut(true);
+        if (!res.ok) {
+          throw new Error(`cheat ${res.status}`);
+        }
+
+        const data = await res.json();
+        setStrikeCount(data.misbehavior_count ?? cheatCount + 1);
+        setStrikeMsg(`⚠ Warning ${data.misbehavior_count}/4 — Tab switch or full-screen exit detected.`);
+
+        if (data.terminated) {
+          setTermMsg(data.termination_message || "Interview terminated.");
+          setPhase("terminated");
+          if (document.fullscreenElement) document.exitFullscreen();
+          return;
+        }
+
+        setCurrent((prev) => ({
+          reaction: data.reaction ?? prev?.reaction ?? "",
+          question: data.question ?? prev?.question ?? "",
+          number: data.question_number ?? prev?.number ?? 1,
+          audio_b64: data.audio_b64 ?? null,
+        }));
+        if (data.audio_b64) {
+          setPendingCheatAudio(data.audio_b64);
+        }
+        setPhase("ai_speaking");
+      } catch (err) {
+        logErr("triggerCheat", err);
       }
-      return newCount;
     });
-  }, [isLockedOut, session_id, stopAudio]);
+  }, [cheatCount, isLockedOut, session_id, stopEverything]);
 
   useEffect(() => {
     const isActivePhase = ["ai_speaking", "recording", "processing", "processing_counter"].includes(phase);
@@ -293,6 +308,17 @@ export default function InterviewRoomPage() {
       console.warn("Fullscreen request failed", err);
     }
     setIsLockedOut(false);
+    if (pendingCheatAudio) {
+      try {
+        await playAudio(pendingCheatAudio);
+      } catch (err) {
+        logErr("returnToInterview playAudio", err);
+      }
+      setPendingCheatAudio(null);
+    }
+    if (phase !== "terminated" && phase !== "done") {
+      await startRecording();
+    }
   };
 
   // ── Timer ──────────────────────────────────────────────────────────────────
@@ -530,7 +556,7 @@ export default function InterviewRoomPage() {
             {/* Reaction */}
             {current.reaction && !aiCounter && (
               <p className="text-white/50 text-base italic text-center max-w-md">
-                "{current.reaction}"
+                &quot;{current.reaction}&quot;
               </p>
             )}
 
@@ -538,7 +564,7 @@ export default function InterviewRoomPage() {
             {aiCounter && (
               <div className="w-full bg-white/5 border border-white/10 rounded-xl p-4 text-center">
                 <p className="text-xs text-white/30 uppercase tracking-widest mb-2">Interviewer replied</p>
-                <p className="text-white/80 text-sm leading-relaxed italic">"{aiCounter}"</p>
+                <p className="text-white/80 text-sm leading-relaxed italic">&quot;{aiCounter}&quot;</p>
               </div>
             )}
 
@@ -622,7 +648,7 @@ export default function InterviewRoomPage() {
             <div className="text-5xl">🚫</div>
             <div>
               <h2 className="text-xl font-semibold text-red-400 mb-3">Interview Terminated</h2>
-              <p className="text-white/60 text-sm leading-relaxed italic mb-2">"{termMsg}"</p>
+              <p className="text-white/60 text-sm leading-relaxed italic mb-2">&quot;{termMsg}&quot;</p>
               {strikeCount > 0 && (
                  <p className="text-white/30 text-xs">Your responses were flagged {strikeCount} time{strikeCount !== 1 ? "s" : ""}.</p>
               )}

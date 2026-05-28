@@ -17,7 +17,15 @@ from fastapi import APIRouter, UploadFile, File, Form, HTTPException
 from pydantic import BaseModel
 
 from app.services.resume_parser import parse_resume
-from app.services.question_engine import generate_first_question, generate_follow_up
+from app.services.question_engine import (
+    generate_first_question,
+    generate_follow_up,
+    build_coverage,
+    pick_next_target,
+    _detect_topic,
+    STRIKE_WARNINGS,
+    MAX_MISBEHAVIOR,
+)
 from app.services.feedback_engine import generate_feedback
 from app.services.groq_client import transcribe, text_to_speech
 from app.core.config import settings
@@ -58,6 +66,45 @@ def get_session(session_id: str) -> dict:
         else:
             raise HTTPException(404, f"Session '{session_id}' not found")
     return s
+
+
+def _format_cheat_warning(count: int) -> str:
+    if count <= 0:
+        return ""
+    return STRIKE_WARNINGS[min(count - 1, len(STRIKE_WARNINGS) - 1)] + " "
+
+
+def _generate_next_question_after_cheat(session: dict) -> tuple[str, str]:
+    current_question = session.get("current_question", "")
+    resume_data = session["resume_data"]
+    history = session["history"]
+    last_topic = _detect_topic(current_question, resume_data)
+
+    coverage = build_coverage(resume_data, history)
+    next_target = pick_next_target(
+        coverage=coverage,
+        questions_asked=len(history),
+        history=history,
+        resume_data=resume_data,
+        force_skip_label=last_topic if last_topic else None,
+    )
+
+    next_question = next_target["instruction"]
+    warning = _format_cheat_warning(session.get("misbehavior_count", 0))
+    reaction = f"{warning}You left the interview. Let's continue with a new question."
+    return next_question, reaction
+
+
+def _register_cheat_event(session: dict, reason: str = "Tab switch or full-screen exit detected.") -> int:
+    count = session.get("misbehavior_count", 0) + 1
+    session["misbehavior_count"] = count
+    session["misbehavior_log"].append({
+        "question": session.get("current_question", "<unknown>"),
+        "reason": reason,
+        "strike": count,
+    })
+    session.setdefault("cheat_events", []).append({"reason": reason, "strike": count})
+    return count
 
 
 # ── Speech metrics ─────────────────────────────────────────────────────────────
@@ -178,6 +225,8 @@ async def start_interview(
         "counter_turns": [],
         "misbehavior_count": 0,
         "misbehavior_log": [],
+        "cheat_events": [],
+        "skip_current_question": False,
         "terminated": False,
         "termination_message": "",
         "speech_metrics_log": [],
@@ -189,6 +238,63 @@ async def start_interview(
         "session_id": session_id,
         "question": first_question,
         "question_number": 1,
+    }
+
+
+class CheatRequest(BaseModel):
+    session_id: str
+
+
+@router.post("/cheat")
+async def report_cheat(body: CheatRequest):
+    session = get_session(body.session_id)
+    if session["status"] != "active":
+        raise HTTPException(400, "Interview is not active")
+
+    new_count = _register_cheat_event(session)
+    save_session(body.session_id, session)
+
+    if new_count >= MAX_MISBEHAVIOR:
+        session["status"] = "terminated"
+        session["terminated"] = True
+        session["termination_message"] = (
+            "Interview automatically terminated due to repeated tab switches or exiting full-screen."
+        )
+        save_session(body.session_id, session)
+        audio_b64 = await text_to_speech(session["termination_message"])
+        return {
+            "terminated": True,
+            "termination_message": session["termination_message"],
+            "misbehavior_count": new_count,
+            "audio_b64": audio_b64,
+        }
+
+    # Skip the current question after the cheat event.
+    skipped_question = session.get("current_question", "")
+    session["history"].append({
+        "question": skipped_question,
+        "answer": "[skipped due to tab switch/full-screen exit]",
+        "speech_metrics": compute_speech_metrics(""),
+        "cheat_skip": True,
+    })
+
+    next_q, reaction = _generate_next_question_after_cheat(session)
+    session["current_question"] = next_q
+    session["current_reaction"] = reaction
+    session["question_count"] = session.get("question_count", 1) + 1
+    session["skip_current_question"] = False
+    save_session(body.session_id, session)
+
+    audio_b64 = await text_to_speech(f"{reaction} {next_q}".strip())
+    return {
+        "done": False,
+        "terminated": False,
+        "reaction": reaction,
+        "question": next_q,
+        "question_number": session["question_count"],
+        "audio_b64": audio_b64,
+        "strike_issued": True,
+        "misbehavior_count": new_count,
     }
 
 
@@ -204,6 +310,34 @@ async def next_question(body: NextQuestionRequest):
     session = get_session(body.session_id)
     if session["status"] != "active":
         raise HTTPException(400, "Interview is not active")
+
+    if session.get("skip_current_question"):
+        session["skip_current_question"] = False
+        skipped_question = session.get("current_question", "")
+        session["history"].append({
+            "question": skipped_question,
+            "answer": "[skipped due to tab switch/full-screen exit]",
+            "speech_metrics": compute_speech_metrics(""),
+            "cheat_skip": True,
+        })
+        next_q, reaction = _generate_next_question_after_cheat(session)
+        session["current_question"] = next_q
+        session["current_reaction"] = reaction
+        session["question_count"] = session.get("question_count", 1) + 1
+        session["counter_turns"] = []
+        save_session(body.session_id, session)
+        audio_b64 = await text_to_speech(f"{reaction} {next_q}".strip())
+        return {
+            "done": False,
+            "terminated": False,
+            "reaction": reaction,
+            "question": next_q,
+            "question_number": session["question_count"],
+            "audio_b64": audio_b64,
+            "strike_issued": False,
+            "misbehavior_count": session.get("misbehavior_count", 0),
+            "answer_quality": "ok",
+        }
 
     # Compute speech metrics for this answer
     speech = compute_speech_metrics(body.transcript)
