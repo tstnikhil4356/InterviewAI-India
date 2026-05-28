@@ -17,9 +17,12 @@ def _get_client() -> Groq:
     return Groq(api_key=api_key)
 
 
-LLM_MODEL     = "llama-3.3-70b-versatile" # "llama-3.3-70b-versatile"
+LLM_MODEL     = "llama-3.1-8b-instant" # "llama-3.3-70b-versatile"
 WHISPER_MODEL = "whisper-large-v3"
 TTS_MODEL     = "playai-tts"
+# Default voice for TTS. Can be overridden with the TTS_VOICE env var.
+# Recommended: en-IN-NeerjaNeural (Female, Professional HR/interviewer)
+VOICE = os.getenv("TTS_VOICE", "en-IN-NeerjaNeural")
 
 
 def chat(messages: list[dict], temperature: float = 0.7) -> str:
@@ -28,7 +31,7 @@ def chat(messages: list[dict], temperature: float = 0.7) -> str:
         model=LLM_MODEL,
         messages=messages,
         temperature=temperature,
-        max_tokens=1024,
+        max_tokens=4096,
     )
     return response.choices[0].message.content.strip()
 
@@ -52,7 +55,8 @@ async def text_to_speech(text: str) -> str | None:
         import edge_tts
         import io
 
-        voice = "en-US-ChristopherNeural"   # cold, authoritative interviewer
+        # Use configured voice (env TTS_VOICE) or default VOICE constant
+        voice = VOICE
         communicate = edge_tts.Communicate(text, voice)
 
         buf = io.BytesIO()

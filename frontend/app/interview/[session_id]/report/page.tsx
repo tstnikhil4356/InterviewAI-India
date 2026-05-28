@@ -278,7 +278,7 @@ export default function ReportPage() {
   });
 
   return (
-    <div style={{ minHeight: "100vh", background: "#080b12", color: "white", fontFamily: "'DM Sans', system-ui, sans-serif" }}>
+    <div style={{ minHeight: "100vh", position: "relative", overflow: "hidden", background: "#080b12", backgroundImage: "radial-gradient(circle at top left, rgba(59,130,246,0.15), transparent 24%), radial-gradient(circle at bottom right, rgba(99,102,241,0.08), transparent 26%)", color: "white", fontFamily: "'DM Sans', system-ui, sans-serif" }}>
       <style>{`
         @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700;800&family=DM+Mono:wght@400;500&display=swap');
         @keyframes spin { to { transform: rotate(360deg); } }
@@ -295,7 +295,7 @@ export default function ReportPage() {
                      radial-gradient(ellipse 50% 30% at 80% 100%, rgba(99,102,241,0.04) 0%, transparent 60%)` }} />
 
       {/* Header */}
-      <header style={{ position: "sticky", top: 0, zIndex: 50, borderBottom: "1px solid rgba(255,255,255,0.05)", background: "rgba(8,11,18,0.9)", backdropFilter: "blur(16px)", padding: "0 32px" }}>
+      <header style={{ position: "sticky", top: 0, zIndex: 50, borderBottom: "1px solid rgba(255,255,255,0.05)", background: "rgba(8,11,18,0.96)", backdropFilter: "blur(20px)", padding: "0 32px" }}>
         <div style={{ maxWidth: 980, margin: "0 auto", height: 60, display: "flex", alignItems: "center", justifyContent: "space-between" }}>
           <div style={{ display: "flex", alignItems: "center", gap: 16 }}>
             <span style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: "0.14em", color: "rgba(255,255,255,0.2)", fontFamily: "'DM Mono', monospace" }}>Assessment Report</span>

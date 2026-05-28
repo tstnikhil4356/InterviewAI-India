@@ -298,6 +298,8 @@ QUESTION: [your question]"""
 
 # ── Answer quality ─────────────────────────────────────────────────────────────
 
+# ── Answer quality ─────────────────────────────────────────────────────────────
+
 def assess_answer(answer: str, question: str) -> str:
     if not answer or len(answer.strip()) < 6:
         return "gibberish"
@@ -311,20 +313,33 @@ NOTE: This is a speech-to-text transcript. You MUST ignore typos, grammatical er
 
 Pick exactly ONE:
 
-gibberish — 100% complete nonsense or completely unrelated random text. Do NOT use this for poor, incorrect, or incomplete answers.
-evasive — Deliberate refusal to engage. Examples: "I don't want to answer", "why are you asking this". 
+gibberish — 100% nonsense or completely unrelated random text. Do NOT use this for poor, incorrect, or incomplete answers.
+
+evasive — Deliberate refusal to engage, deflecting, OR PARROTING. 
+Mark as evasive if the candidate:
+1. Simply repeats/parrots the question back to you without providing an actual answer.
+2. Makes "meta" comments (e.g., "I got this from ChatGPT", "Let me Google that", "AI wrote that") instead of answering the technical question.
+3. Explicitly refuses to answer.
 NOT evasive: admitting "I don't know" while attempting to answer.
+
 vague — Attempted to answer but used only contentless generic buzzwords. No specific tools, numbers, or personal actions described.
+
 ok — Made a genuine attempt with at least one concrete element (a specific tool, metric, action, scenario), OR demonstrated conceptual understanding even if imperfect.
 
 When in doubt between ok, vague, and gibberish -> choose ok.
+BUT if they are just repeating the question back or joking about ChatGPT -> MUST choose evasive.
 
 One word only: gibberish, evasive, vague, or ok"""
 
     result = chat([{"role": "user", "content": prompt}], temperature=0.1)
-    word = result.strip().lower().split()[0]
-    return word if word in ("gibberish", "evasive", "vague", "ok") else "ok"
 
+    # Clean up the output to ensure it matches our expected categories
+    word = result.strip().lower().split()[0]
+    # Strip out any trailing punctuation the LLM might add (like "evasive." instead of "evasive")
+    import string
+    word = word.translate(str.maketrans('', '', string.punctuation))
+
+    return word if word in ("gibberish", "evasive", "vague", "ok") else "ok"
 
 # ── Coverage tracking ──────────────────────────────────────────────────────────
 

@@ -3,29 +3,53 @@
 @tailwind utilities;
 
 @layer base {
-  * {
-    box-sizing: border-box;
-  }
+  * { box-sizing: border-box; }
+  html { scroll-behavior: smooth; }
+  ::selection { background: rgba(99,102,241,0.35); color: #fff; }
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-track { background: #080C14; }
+  ::-webkit-scrollbar-thumb { background: #1e2433; border-radius: 99px; }
+  ::-webkit-scrollbar-thumb:hover { background: #2d3548; }
 }
 
 @layer components {
   .btn-primary {
-    @apply bg-brand-600 text-white px-4 py-2 rounded-lg font-medium
-           hover:bg-brand-800 transition-colors disabled:opacity-50 disabled:cursor-not-allowed;
+    @apply bg-indigo-500 text-white px-4 py-2 rounded-xl font-medium text-sm
+           hover:bg-indigo-400 hover:scale-105 active:scale-95
+           transition-all duration-200 disabled:opacity-40 disabled:cursor-not-allowed
+           shadow-lg shadow-indigo-500/25;
   }
-
   .btn-secondary {
-    @apply bg-white text-gray-700 border border-gray-200 px-4 py-2 rounded-lg font-medium
-           hover:bg-gray-50 transition-colors;
+    @apply bg-transparent text-gray-300 border border-white/10 px-4 py-2 rounded-xl font-medium text-sm
+           hover:border-white/25 hover:text-white hover:scale-105 active:scale-95
+           transition-all duration-200;
   }
-
   .input {
-    @apply w-full border border-gray-200 rounded-lg px-3 py-2 text-sm
-           focus:outline-none focus:ring-2 focus:ring-brand-400 focus:border-transparent
-           placeholder:text-gray-400;
+    @apply w-full bg-white/[0.04] border border-white/10 rounded-xl px-3 py-2.5 text-sm text-white
+           focus:outline-none focus:ring-2 focus:ring-indigo-500/50 focus:border-indigo-500/50
+           placeholder:text-gray-600 transition-all duration-200;
   }
-
   .card {
-    @apply bg-white rounded-xl border border-gray-100 shadow-sm p-6;
+    @apply bg-[#0D1117] rounded-2xl border border-white/[0.07] p-6
+           hover:border-indigo-500/25 transition-all duration-300;
   }
+}
+
+@layer utilities {
+  .animate-fade-in {
+    animation: fadeIn 0.5s ease both;
+  }
+  .animate-hero-up {
+    animation: heroUp 0.8s cubic-bezier(0.16,1,0.3,1) both;
+  }
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+@keyframes heroUp {
+  from { opacity: 0; transform: translateY(32px); }
+  to   { opacity: 1; transform: translateY(0); }
 }

@@ -1,8 +1,11 @@
 """
-interview.py — Fixed & Enhanced v3
+interview.py — Fixed & Enhanced v5
 Fixes:
-  1. Solved the "previous-to-previous" question bug by passing the full `session["history"]`
-     to `generate_follow_up` without stripping the last element (`[:-1]`).
+  1. Solved the "previous-to-previous" question bug by passing the full `session["history"]`.
+  2. Replaced fragile .splitlines() with robust Regex in the /counter endpoint.
+  3. Gracefully handles STT misinterpretations (e.g., hearing "Chef" instead of "SHAP").
+  4. /end now accepts a termination 'reason' from the frontend anti-cheat.
+  5. /report now gracefully returns a blank report instead of a 400 error if terminated early.
 """
 
 import json
@@ -219,8 +222,6 @@ async def next_question(body: NextQuestionRequest):
 
     misbehavior_count: int = session.get("misbehavior_count", 0)
 
-    # FIXED: We now pass the FULL history (without [:-1]) so the engine
-    # knows exactly which question was just answered.
     result = generate_follow_up(
         resume_data=session["resume_data"],
         role=session["role"],
@@ -321,20 +322,29 @@ async def counter(body: CounterRequest):
 
     from app.services.groq_client import chat
 
-    context = f"""You are a DOMINANT, senior technical interviewer. You do NOT get pushed around.  
+    context = f"""You are a senior technical interviewer. You are firm and direct, but FAIR and REASONABLE.
 You just asked: "{session['current_question']}"  
 Your previous reaction was: "{session['current_reaction']}"  
 The candidate pushed back with: "{body.counter_text}"  
 Counter exchange: {len(turns)} message(s)  
 Force move on: {force_move_on}  
 
-{"Since this has gone on long enough, FIRMLY shut it down and restate your original question. Be cold." if force_move_on else "Respond with authority. If they make a valid point, acknowledge it in ONE word then move on. If they're deflecting, call it out directly. You do not apologise, you do not soften your tone."}  
+CRITICAL RULE ON CORRECTIONS: 
+This interview uses a Speech-to-Text engine. It frequently mishears technical terms (e.g., hearing "Chef" instead of "SHAP", "React" instead of "Read that", etc.). 
+If the candidate is correcting a misheard word or clarifying a misunderstanding:
+1. Accept the correction instantly and gracefully.
+2. Acknowledge the mix-up in ONE brief sentence (e.g., "Ah, my mistake, the audio cut out. Tell me about SHAP then.").
+3. ACTION must be 'repeat_question' (rephrased using their corrected term) OR 'move_on'.
+Do NOT accuse them of changing their story or lying if it is clearly a phonetic STT error.
+
+However, if they are genuinely deflecting, stalling, or refusing to answer (and not correcting a typo), call it out directly and firmly.
+
+{"Since this has gone on long enough, firmly shut it down and move to the next topic." if force_move_on else ""}  
 
 RULES:
-- Maximum 2 sentences. Be SHARP and DIRECT.  
-- Never capitulate. Never say 'good point' unless they were genuinely correct.  
-- If they're stalling or being difficult: "I noticed that. Let's move on."  
-- End by either asking the question again OR stating "Let's continue."  
+- Maximum 2 sentences.
+- Speak naturally and conversationally.
+- Never use the word "acknowledge" or "capitulate". Just speak normally.
 
 Respond with ONLY:  
 RESPONSE: [your reply]  
@@ -343,17 +353,23 @@ ACTION: repeat_question OR move_on
 
     raw = chat([{"role": "user", "content": context}], temperature=0.6)
 
-    ai_response = ""
+    # 1. Determine the action safely, no matter where it is in the string
     action = "move_on"
-    for line in raw.strip().splitlines():
-        if line.upper().startswith("RESPONSE:"):
-            ai_response = line[len("RESPONSE:"):].strip()
-        elif line.upper().startswith("ACTION:"):
-            a = line[len("ACTION:"):].strip().lower()
-            action = "repeat_question" if "repeat" in a else "move_on"
+    if "REPEAT_QUESTION" in raw.upper():
+        action = "repeat_question"
 
+    # 2. Strip out the internal instruction tags using Regex
+    clean_text = raw
+    clean_text = re.sub(r'ACTION:\s*(repeat_question|move_on)', '', clean_text, flags=re.IGNORECASE)
+    clean_text = re.sub(r'RESPONSE:\s*', '', clean_text, flags=re.IGNORECASE)
+
+    # 3. Clean up any leftover whitespace or stray quotes
+    ai_response = clean_text.strip().strip('"\'')
+
+    # Fallback in case the LLM completely glitches out
     if not ai_response:
-        ai_response = raw.strip()
+        ai_response = "I understand. Let's continue."
+
     if force_move_on:
         action = "move_on"
 
@@ -380,13 +396,20 @@ ACTION: repeat_question OR move_on
 
 class EndRequest(BaseModel):
     session_id: str
+    reason: str | None = None  # Allow frontend to pass termination reason
 
 
 @router.post("/end")
 async def end_interview(body: EndRequest):
     session = get_session(body.session_id)
     if session["status"] == "active":
-        session["status"] = "completed"
+        if body.reason:
+            session["status"] = "terminated"
+            session["terminated"] = True
+            session["termination_message"] = body.reason
+            session["misbehavior_count"] = 3
+        else:
+            session["status"] = "completed"
     save_session(body.session_id, session)
     return {"message": "Interview ended", "session_id": body.session_id}
 
@@ -398,39 +421,38 @@ async def get_report(session_id: str):
     session = get_session(session_id)
     is_terminated = session.get("terminated", False)
 
-    # If terminated with zero history (kicked out on Q1 before submitting any answer)
+    # If terminated with zero history, gracefully return a blank report
+    # instead of crashing with a 400 error.
     if not session["history"]:
-        if is_terminated:
-            return {
-                "session_id": session_id,
-                "role": session["role"],
-                "level": session["level"],
-                "questions_answered": 0,
-                "misbehavior_count": session.get("misbehavior_count", 0),
-                "terminated": True,
-                "termination_message": session.get("termination_message", "Interview terminated."),
-                "misbehavior_log": session.get("misbehavior_log", []),
-                "speech_metrics_log": [],
-                "feedback": {
-                    "overall_score": 0,
-                    "confidence_score": 0,
-                    "clarity_score": 0,
-                    "technical_depth_score": 0,
-                    "communication_score": 0,
-                    "behaviour_score": 0,
-                    "speech_clarity_score": 0,
-                    "summary": "The interview was terminated before any answers were recorded. No performance data is available.",
-                    "speech_summary": "No speech data recorded.",
-                    "confidence_calibration": "under-confident",
-                    "confidence_note": "Interview was terminated before meaningful data could be collected.",
-                    "strengths": [],
-                    "improvements": ["Complete at least one full answer before the interview can be assessed."],
-                    "behavioral_flags": [],
-                    "question_feedback": [],
-                    "recommended_topics": [],
-                },
-            }
-        raise HTTPException(400, "No data to generate report from")
+        return {
+            "session_id": session_id,
+            "role": session["role"],
+            "level": session["level"],
+            "questions_answered": 0,
+            "misbehavior_count": session.get("misbehavior_count", 0),
+            "terminated": is_terminated,
+            "termination_message": session.get("termination_message", "Interview ended before answering any questions."),
+            "misbehavior_log": session.get("misbehavior_log", []),
+            "speech_metrics_log": [],
+            "feedback": {
+                "overall_score": 0,
+                "confidence_score": 0,
+                "clarity_score": 0,
+                "technical_depth_score": 0,
+                "communication_score": 0,
+                "behaviour_score": 0,
+                "speech_clarity_score": 0,
+                "summary": "The interview ended before any answers were recorded. No performance data is available.",
+                "speech_summary": "No speech data recorded.",
+                "confidence_calibration": "under-confident",
+                "confidence_note": "Interview ended before meaningful data could be collected.",
+                "strengths": [],
+                "improvements": ["Complete at least one full answer before the interview can be assessed."],
+                "behavioral_flags": [],
+                "question_feedback": [],
+                "recommended_topics": [],
+            },
+        }
 
     feedback = generate_feedback(
         resume_data=session["resume_data"],
