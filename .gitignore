@@ -9,6 +9,7 @@ frontend/out/
 frontend/build/
 
 # Python
+venv/
 backend/venv/
 backend/__pycache__/
 backend/app/__pycache__/
@@ -27,10 +28,3 @@ frontend/.env.local
 .DS_Store
 *.log
 .vercel
-
-# Root virtual environment
-venv/
-
-# Python cache
-__pycache__/
-*.pyc

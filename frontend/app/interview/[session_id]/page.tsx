@@ -4,7 +4,6 @@ import { useEffect, useRef, useState, useCallback } from "react";
 import { useParams, useRouter } from "next/navigation";
 import toast from "react-hot-toast";
 
-// ── Types ─────────────────────────────────────────────────────────────────────
 type Phase =
   | "loading"
   | "begin"
@@ -24,6 +23,21 @@ interface Turn {
 
 const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 
+const ANSWER_QUALITY_LABELS: Record<string, string> = {
+  evasive:    "evasive or non-responsive",
+  gibberish:  "incoherent",
+  rude:       "unprofessional",
+  fabricated: "inconsistent with your resume",
+  admitted_gap: "honest knowledge gap",
+};
+
+// How long (ms) to wait after audio.onended before opening the mic.
+// audio.onended fires when the decoded buffer drains, but the OS audio
+// pipeline still holds ~200-300 ms of samples. Without this pause the
+// microphone opens while those samples are still coming out of the
+// speakers and Whisper transcribes the interviewer's own voice.
+const MIC_OPEN_DELAY_MS = 350;
+
 function log(step: string, detail?: unknown) {
   detail !== undefined
     ? console.log(`[AUDIO] ${step}`, detail)
@@ -42,31 +56,42 @@ export default function InterviewRoomPage() {
   const [transcript, setTranscript]     = useState("");
   const [seconds, setSeconds]           = useState(0);
   const [aiCounter, setAiCounter]       = useState("");
-  const [strikeCount, setStrikeCount]   = useState(0);
+
+  const [evasiveCount, setEvasiveCount] = useState(0);
+  const [cheatCount, setCheatCount]     = useState(0);
+  const [idkCount, setIdkCount]         = useState(0);
+
   const [strikeMsg, setStrikeMsg]       = useState<string | null>(null);
   const [termMsg, setTermMsg]           = useState("");
-  const [pendingCheatAudio, setPendingCheatAudio] = useState<string | null>(null);
 
-  // ── Anti-Cheat / Screen Lock State ──
+  // Anti-Cheat State
   const [isLockedOut, setIsLockedOut]   = useState(false);
-  const [cheatCount, setCheatCount]     = useState(0);
+  const [isViolationProcessing, setIsViolationProcessing] = useState(false);
+  const isLockedOutRef                  = useRef(false);
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const chunksRef        = useRef<Blob[]>([]);
   const streamRef        = useRef<MediaStream | null>(null);
   const timerRef         = useRef<NodeJS.Timeout | null>(null);
   const firstQRef        = useRef("");
+  // FIX: stores pre-generated audio for the first question from setup page
+  const firstQAudioRef   = useRef<string | null>(null);
   const recognitionRef   = useRef<any>(null);
+  const phaseRef         = useRef<Phase>(phase);
 
-  // Audio references for forceful stopping
   const currentAudioRef  = useRef<HTMLAudioElement | null>(null);
   const audioResolveRef  = useRef<(() => void) | null>(null);
   const lastCheatTimeRef = useRef<number>(0);
+  const pendingAudioRef  = useRef<string | null>(null);
 
-  // ── Play base64 audio ──────────────────────────────────────────────────────
+  useEffect(() => {
+    phaseRef.current = phase;
+  }, [phase]);
+
   const playAudio = useCallback(async (b64: string): Promise<void> => {
     return new Promise((resolve) => {
       try {
+        if (!b64) { resolve(); return; }
         const bytes = Uint8Array.from(atob(b64), (c) => c.charCodeAt(0));
         const blob  = new Blob([bytes], { type: "audio/mpeg" });
         const url   = URL.createObjectURL(blob);
@@ -89,21 +114,80 @@ export default function InterviewRoomPage() {
     });
   }, []);
 
+  const stopAudio = useCallback(() => {
+    if (currentAudioRef.current) {
+      currentAudioRef.current.pause();
+      currentAudioRef.current = null;
+    }
+    if (audioResolveRef.current) {
+      audioResolveRef.current();
+      audioResolveRef.current = null;
+    }
+  }, []);
+
   const fetchAndPlay = useCallback(async (text: string): Promise<void> => {
     try {
       const res = await fetch(`${API}/api/interview/speak`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ session_id, text }),
+        body: JSON.stringify({ text }),
       });
-      if (!res.ok) throw new Error(`speak ${res.status}`);
-      const { audio_b64 } = await res.json();
-      if (audio_b64) await playAudio(audio_b64);
+      if (!res.ok) return;
+      const data = await res.json();
+      if (data.audio_b64) await playAudio(data.audio_b64);
+    } catch (err) { logErr("fetchAndPlay", err); }
+  }, [playAudio]);
+
+  // FIX A: guard against opening mic during a lockout, and request
+  // echo cancellation so speaker-to-mic feedback is filtered by the
+  // browser/OS even on non-headphone setups.
+  const startRecording = useCallback(async () => {
+    // If a cheat lockout fired while audio was still playing and
+    // force-resolved the playAudio promise, speakTurn will call
+    // startRecording with isLockedOutRef.current = true. Bail immediately.
+    if (isLockedOutRef.current) return;
+
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: { ideal: true }, // filter speaker → mic feedback
+          noiseSuppression: { ideal: true },
+          autoGainControl:  { ideal: true },
+        },
+      });
+      streamRef.current = stream;
+      chunksRef.current = [];
+
+        const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+      if (SR) {
+        const rec = new SR();
+        rec.continuous = true;
+        rec.interimResults = true;
+        rec.lang = "en-IN";
+        let final = "";
+        rec.onresult = (e: any) => {
+          let interim = "";
+          for (let i = e.resultIndex; i < e.results.length; i++) {
+            const t = e.results[i][0].transcript;
+            if (e.results[i].isFinal) final += t + " ";
+            else interim = t;
+          }
+          setTranscript(final + interim);
+        };
+        rec.start();
+        recognitionRef.current = rec;
+      }
+
+      const mr = new MediaRecorder(stream, { mimeType: "audio/webm" });
+      mediaRecorderRef.current = mr;
+      mr.ondataavailable = (e) => { if (e.data.size > 0) chunksRef.current.push(e.data); };
+      mr.start(250);
+      setPhase("recording");
     } catch (err) {
-      logErr("fetchAndPlay", err);
-      toast.error("Failed to play TTS audio.");
+      logErr("getUserMedia", err);
+      toast.error("Microphone access denied.");
     }
-  }, [session_id, playAudio]);
+  }, []);
 
   const stopRecorder = useCallback((): Promise<Blob> => {
     return new Promise((resolve) => {
@@ -116,55 +200,6 @@ export default function InterviewRoomPage() {
     });
   }, []);
 
-  const startRecording = useCallback(async (): Promise<void> => {
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      streamRef.current = stream;
-      chunksRef.current = [];
-
-      const SR = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-      if (SR) {
-        const rec = new SR();
-        rec.continuous = true;
-        rec.interimResults = true;
-        rec.lang = "en-IN";
-        let finalTranscript = "";
-        rec.onresult = (e: any) => {
-          let interim = "";
-          for (let i = e.resultIndex; i < e.results.length; i++) {
-            const t = e.results[i][0].transcript;
-            if (e.results[i].isFinal) finalTranscript += t + " ";
-            else interim = t;
-          }
-          setTranscript(finalTranscript + interim);
-        };
-        rec.start();
-        recognitionRef.current = rec;
-      }
-
-      const mr = new MediaRecorder(stream, { mimeType: "audio/webm" });
-      mediaRecorderRef.current = mr;
-      mr.ondataavailable = (e) => { if (e.data.size > 0) chunksRef.current.push(e.data); };
-      mr.start(250);
-      setPhase("recording");
-    } catch (err) {
-      logErr("startRecording", err);
-      toast.error("Microphone access denied.");
-    }
-  }, []);
-
-  const stopEverything = useCallback(async (): Promise<void> => {
-    if (currentAudioRef.current) {
-      currentAudioRef.current.pause();
-      currentAudioRef.current = null;
-    }
-    if (audioResolveRef.current) {
-      audioResolveRef.current();
-      audioResolveRef.current = null;
-    }
-    await stopRecorder();
-  }, [stopRecorder]);
-
   const transcribeBlob = useCallback(async (blob: Blob): Promise<string> => {
     const fd = new FormData();
     fd.append("audio", blob, "answer.webm");
@@ -174,7 +209,9 @@ export default function InterviewRoomPage() {
     return text || "";
   }, []);
 
-  // ── AI Speaking Flow ──────────────────────────────────────────────────────
+  // FIX B: use pre-generated audio_b64 when the backend already did TTS
+  // (avoids a second /speak roundtrip), and add MIC_OPEN_DELAY_MS after
+  // playback ends so the OS audio pipeline fully drains before the mic opens.
   const speakTurn = useCallback(async (turn: Turn) => {
     setCurrent(turn);
     setTranscript("");
@@ -182,13 +219,20 @@ export default function InterviewRoomPage() {
     setStrikeMsg(null);
     setPhase("ai_speaking");
 
-    const fullText = turn.reaction ? `${turn.reaction} ${turn.question}` : turn.question;
-    await fetchAndPlay(fullText);
+    if (turn.audio_b64) {
+      await playAudio(turn.audio_b64);
+    } else {
+      const fullText = turn.reaction ? `${turn.reaction} ${turn.question}` : turn.question;
+      await fetchAndPlay(fullText);
+    }
+
+    // Wait for OS audio pipeline to fully drain before opening mic.
+    await new Promise<void>((r) => setTimeout(r, MIC_OPEN_DELAY_MS));
 
     await startRecording();
-  }, [fetchAndPlay, startRecording]);
+  }, [fetchAndPlay, startRecording, playAudio]);
 
-  // ── Load session ─────────────────────────────────────────────────────────
+  // ── Session init ─────────────────────────────────────────────────────────
   useEffect(() => {
     async function init() {
       try {
@@ -203,6 +247,20 @@ export default function InterviewRoomPage() {
         }
 
         firstQRef.current = data.current_question;
+        setCheatCount(data.misbehavior_count || 0);
+        setIdkCount(data.idk_count || 0);
+
+        // FIX: pull the pre-generated first-question audio that the setup
+        // page stashed in sessionStorage after /start returned it.
+        try {
+          const stored = sessionStorage.getItem(`session_${session_id}`);
+          if (stored) {
+            const parsed = JSON.parse(stored);
+            if (parsed.question)  firstQRef.current      = parsed.question;
+            if (parsed.audio_b64) firstQAudioRef.current = parsed.audio_b64;
+          }
+        } catch { /* ignore parse errors — just fall through to /speak */ }
+
         setPhase("begin");
       } catch (err) {
         logErr("session load", err);
@@ -224,70 +282,85 @@ export default function InterviewRoomPage() {
 
     const q = firstQRef.current;
     if (!q) return;
-    await speakTurn({ reaction: "", question: q, number: 1, audio_b64: null });
+    // FIX: pass pre-generated audio through so speakTurn skips the /speak call
+    await speakTurn({
+      reaction:  "",
+      question:  q,
+      number:    1,
+      audio_b64: firstQAudioRef.current,
+    });
   }, [speakTurn]);
 
-  // ── Anti-Cheat Observers (Tab Switch & Escape) ───────────────────────────
-  const triggerCheat = useCallback(() => {
+  // ── Anti-Cheat Trigger ────────────────────────────────────────────────────
+  const triggerCheat = useCallback(async () => {
     const now = Date.now();
-    // Debounce by 1 second (prevents Alt+Tab firing visibility & fullscreen simultaneously)
-    if (now - lastCheatTimeRef.current < 1000) return;
+    if (now - lastCheatTimeRef.current < 1500) return;
     lastCheatTimeRef.current = now;
 
-    if (isLockedOut) return;
+    const currentPhase = phaseRef.current;
+    if (!["ai_speaking", "recording", "processing", "processing_counter"].includes(currentPhase)) return;
 
+    isLockedOutRef.current = true;
     setIsLockedOut(true);
-    void stopEverything().then(async () => {
-      try {
-        const res = await fetch(`${API}/api/interview/cheat`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ session_id }),
+    setIsViolationProcessing(true);
+
+    stopAudio();
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state === "recording") {
+      mediaRecorderRef.current.stop();
+    }
+    recognitionRef.current?.stop();
+
+    toast.error("Warning: You left the interview screen.", { duration: 4000 });
+    setPhase("processing");
+
+    try {
+      const res = await fetch(`${API}/api/interview/fullscreen-violation`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ session_id })
+      });
+
+      const data = await res.json();
+
+      if (data.terminated) {
+        setTermMsg(data.termination_message);
+        setPhase("terminated");
+
+        setIsLockedOut(false);
+        isLockedOutRef.current = false;
+        setIsViolationProcessing(false);
+
+        if (data.audio_b64) await playAudio(data.audio_b64);
+        if (document.fullscreenElement) document.exitFullscreen();
+      } else {
+        setCheatCount(data.misbehavior_count);
+
+        setCurrent({
+          reaction: data.reaction,
+          question: data.question,
+          number:   data.question_number,
+          audio_b64: data.audio_b64,
         });
 
-        if (!res.ok) {
-          throw new Error(`cheat ${res.status}`);
-        }
+        setTranscript("");
+        setAiCounter("");
+        pendingAudioRef.current = data.audio_b64;
 
-        const data = await res.json();
-        setStrikeCount(data.misbehavior_count ?? cheatCount + 1);
-        setStrikeMsg(`⚠ Warning ${data.misbehavior_count}/4 — Tab switch or full-screen exit detected.`);
-
-        if (data.terminated) {
-          setTermMsg(data.termination_message || "Interview terminated.");
-          setPhase("terminated");
-          if (document.fullscreenElement) document.exitFullscreen();
-          return;
-        }
-
-        setCurrent((prev) => ({
-          reaction: data.reaction ?? prev?.reaction ?? "",
-          question: data.question ?? prev?.question ?? "",
-          number: data.question_number ?? prev?.number ?? 1,
-          audio_b64: data.audio_b64 ?? null,
-        }));
-        if (data.audio_b64) {
-          setPendingCheatAudio(data.audio_b64);
-        }
-        setPhase("ai_speaking");
-      } catch (err) {
-        logErr("triggerCheat", err);
+        setIsViolationProcessing(false);
       }
-    });
-  }, [cheatCount, isLockedOut, session_id, stopEverything]);
+    } catch (err) {
+      logErr("triggerCheat", err);
+      toast.error("Network error processing violation.");
+      setIsViolationProcessing(false);
+    }
+  }, [session_id, stopAudio, playAudio]);
 
   useEffect(() => {
-    const isActivePhase = ["ai_speaking", "recording", "processing", "processing_counter"].includes(phase);
-    if (!isActivePhase) return;
-
     const handleVisibilityChange = () => {
       if (document.hidden) triggerCheat();
     };
-
     const handleFullscreenChange = () => {
-      if (!document.fullscreenElement && phase !== "terminated" && phase !== "done") {
-        triggerCheat();
-      }
+      if (!document.fullscreenElement) triggerCheat();
     };
 
     document.addEventListener("visibilitychange", handleVisibilityChange);
@@ -297,7 +370,7 @@ export default function InterviewRoomPage() {
       document.removeEventListener("visibilitychange", handleVisibilityChange);
       document.removeEventListener("fullscreenchange", handleFullscreenChange);
     };
-  }, [phase, triggerCheat]);
+  }, [triggerCheat]);
 
   const returnToInterview = async () => {
     try {
@@ -307,21 +380,22 @@ export default function InterviewRoomPage() {
     } catch (err) {
       console.warn("Fullscreen request failed", err);
     }
+
     setIsLockedOut(false);
-    if (pendingCheatAudio) {
-      try {
-        await playAudio(pendingCheatAudio);
-      } catch (err) {
-        logErr("returnToInterview playAudio", err);
-      }
-      setPendingCheatAudio(null);
+    isLockedOutRef.current = false;
+
+    setPhase("ai_speaking");
+
+    // FIX D: drain the OS pipeline after pending audio before opening mic.
+    if (pendingAudioRef.current) {
+      await playAudio(pendingAudioRef.current);
+      pendingAudioRef.current = null;
+      await new Promise<void>((r) => setTimeout(r, MIC_OPEN_DELAY_MS));
     }
-    if (phase !== "terminated" && phase !== "done") {
-      await startRecording();
-    }
+
+    await startRecording();
   };
 
-  // ── Timer ──────────────────────────────────────────────────────────────────
   useEffect(() => {
     if (phase === "recording") {
       setSeconds(0);
@@ -332,9 +406,10 @@ export default function InterviewRoomPage() {
     return () => { if (timerRef.current) clearInterval(timerRef.current); };
   }, [phase]);
 
-  // ── Submit answer ─────────────────────────────────────────────────────────
+  // FIX C: stop discarding next.audio_b64 — pass it through to speakTurn
+  // so the pre-generated audio is used and a second /speak roundtrip is avoided.
   const stopAndSubmit = useCallback(async () => {
-    if (isLockedOut) return;
+    if (isLockedOutRef.current || !document.fullscreenElement) return;
 
     setPhase("processing");
     const blob = await stopRecorder();
@@ -372,27 +447,37 @@ export default function InterviewRoomPage() {
       }
 
       if (next.strike_issued) {
-        setStrikeCount(next.misbehavior_count ?? strikeCount + 1);
-        setStrikeMsg(`⚠ Warning ${next.misbehavior_count}/4 — Your answer was flagged as ${next.answer_quality}.`);
-        toast.error(`Strike ${next.misbehavior_count} issued!`, { duration: 4000 });
+        setEvasiveCount(next.misbehavior_count);
+        const qualityLabel = ANSWER_QUALITY_LABELS[next.answer_quality ?? ""] ?? next.answer_quality ?? "lower quality";
+        setStrikeMsg(`⚠ Warning — Your answer was flagged as ${qualityLabel}. This will impact your score.`);
+        toast.error("Quality Warning Issued!", { duration: 4000 });
       }
 
+      if (next.idk_count !== undefined && next.idk_count !== null) {
+        setIdkCount(next.idk_count);
+      }
+      if (next.answer_quality === "admitted_gap") {
+        toast("Honest knowledge gap acknowledged. Moving on.", { icon: "ℹ️" });
+      }
+
+      // FIX C: pass the backend-generated audio_b64 so speakTurn uses it
+      // directly instead of making a second /speak roundtrip.
       await speakTurn({
         reaction:  next.reaction ?? "",
         question:  next.question,
         number:    next.question_number,
-        audio_b64: null,
+        audio_b64: next.audio_b64 ?? null,
       });
     } catch (err) {
       logErr("stopAndSubmit", err);
       toast.error("Something went wrong. Try again.");
       startRecording();
     }
-  }, [session_id, speakTurn, stopRecorder, transcribeBlob, playAudio, strikeCount, startRecording, router, isLockedOut]);
+  }, [session_id, speakTurn, stopRecorder, transcribeBlob, playAudio, startRecording, router]);
 
-  // ── Submit counter ────────────────────────────────────────────────────────
+  // FIX E: drain OS pipeline after counter audio before opening mic.
   const stopAndCounter = useCallback(async () => {
-    if (isLockedOut) return;
+    if (isLockedOutRef.current || !document.fullscreenElement) return;
 
     setPhase("processing_counter");
     const blob = await stopRecorder();
@@ -409,6 +494,8 @@ export default function InterviewRoomPage() {
       setAiCounter(data.ai_response);
 
       if (data.audio_b64) await playAudio(data.audio_b64);
+      // FIX E: wait for OS pipeline to drain before opening mic.
+      await new Promise<void>((r) => setTimeout(r, MIC_OPEN_DELAY_MS));
 
       await startRecording();
     } catch (err) {
@@ -416,12 +503,11 @@ export default function InterviewRoomPage() {
       toast.error("Something went wrong.");
       startRecording();
     }
-  }, [session_id, playAudio, stopRecorder, transcribeBlob, startRecording, isLockedOut]);
+  }, [session_id, playAudio, stopRecorder, transcribeBlob, startRecording]);
 
-  // ── Keyboard Controls ─────────────────────────────────────────────────────
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if (phase !== "recording" || isLockedOut) return;
+      if (phase !== "recording" || isLockedOutRef.current || !document.fullscreenElement) return;
 
       if (e.code === "Space" || e.code === "Enter") {
         e.preventDefault();
@@ -431,46 +517,59 @@ export default function InterviewRoomPage() {
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
-  }, [phase, stopAndSubmit, isLockedOut]);
+  }, [phase, stopAndSubmit]);
 
   const fmt = (s: number) =>
     `${String(Math.floor(s / 60)).padStart(2, "0")}:${String(s % 60).padStart(2, "0")}`;
 
   const isActive = ["ai_speaking","recording","processing","processing_counter"].includes(phase);
 
-  // ── Strike indicator component ────────────────────────────────────────────
-  const StrikeIndicator = () => (
-    <div className="fixed top-4 right-4 z-50 flex gap-2">
-      {[1, 2, 3, 4].map((n) => {
-        const active = n <= strikeCount;
-        return (
-          <div key={n} className={`w-2.5 h-2.5 rounded-full transition-all ${active ? "bg-red-500 shadow-[0_0_8px_rgba(239,68,68,0.75)]" : "bg-white/10 border border-white/20"}`} />
-        );
-      })}
+  const SessionIndicators = () => (
+    <div className="fixed top-4 right-4 z-50 flex flex-col gap-3 text-right">
+      <div className="flex gap-2" title="Communication Warnings">
+        {[1, 2, 3, 4].map((n) => {
+          const active = n <= evasiveCount;
+          return (
+            <div key={n} className={`w-2.5 h-2.5 rounded-full transition-all ${active ? "bg-amber-500 shadow-[0_0_8px_rgba(245,158,11,0.75)]" : "bg-white/10 border border-white/20"}`} />
+          );
+        })}
+      </div>
+      <div className="flex gap-2" title="Honest gap count">
+        {[1, 2, 3].map((n) => {
+          const active = n <= idkCount;
+          return (
+            <div key={n} className={`w-2.5 h-2.5 rounded-full transition-all ${active ? "bg-sky-400 shadow-[0_0_8px_rgba(56,189,248,0.75)]" : "bg-white/10 border border-white/20"}`} />
+          );
+        })}
+      </div>
     </div>
   );
 
   return (
     <div className="min-h-screen overflow-hidden bg-[#080C14] text-white relative">
 
-      {/* ANTI-CHEAT OVERLAY */}
       {isLockedOut && (
         <div className="fixed inset-0 z-[100] bg-black/90 backdrop-blur-md flex flex-col items-center justify-center p-6 text-center animate-fade-in">
           <div className="text-6xl mb-6 animate-pulse">⚠️</div>
           <h1 className="text-3xl font-bold text-red-500 mb-4">Interview Suspended</h1>
           <p className="text-white/70 max-w-md leading-relaxed mb-6 text-lg">
-            Tab switching or exiting full-screen mode is strictly prohibited.
+            Tab switching or exiting full-screen mode is strictly prohibited. Your previous question has been forfeited.
           </p>
           <div className="bg-red-500/10 border border-red-500/30 px-6 py-3 rounded-lg mb-8">
-             <p className="text-red-400 font-bold tracking-wide">
-               STRIKE {cheatCount} OF 3
+             <p className="text-red-400 font-bold tracking-wide uppercase">
+               CHEAT STRIKE {cheatCount > 0 ? cheatCount : 1} OF 3
              </p>
           </div>
           <button
             onClick={returnToInterview}
-            className="px-8 py-4 bg-white text-black font-bold rounded-xl hover:bg-gray-200 transition-transform active:scale-95 shadow-lg shadow-white/10"
+            disabled={isViolationProcessing}
+            className={`px-8 py-4 font-bold rounded-xl transition-all shadow-lg ${
+              isViolationProcessing
+                ? "bg-white/10 text-white/40 cursor-not-allowed border border-white/20"
+                : "bg-white text-black hover:bg-gray-200 active:scale-95 shadow-white/10"
+            }`}
           >
-            Return to Full Screen
+            {isViolationProcessing ? "Generating new question..." : "Acknowledge Warning & Return to Full Screen"}
           </button>
         </div>
       )}
@@ -481,9 +580,8 @@ export default function InterviewRoomPage() {
         <div className="absolute top-1/2 left-1/2 h-[420px] w-[420px] -translate-x-1/2 -translate-y-1/2 rounded-full bg-indigo-500/10 blur-3xl" />
       </div>
 
-      <StrikeIndicator />
+      <SessionIndicators />
 
-      {/* Header */}
       <header className="px-6 py-4 flex items-center justify-between border-b border-white/[0.06] backdrop-blur-sm bg-white/5">
         <span className="text-xs font-semibold tracking-[0.15em] text-white/30 uppercase">Interview Room</span>
         {current && phase !== "begin" && (
@@ -493,15 +591,13 @@ export default function InterviewRoomPage() {
 
       <main className="flex-1 flex flex-col items-center justify-center px-4 gap-8 py-10 max-w-2xl mx-auto w-full">
 
-        {/* Strike warning banner */}
         {strikeMsg && (
-          <div className="w-full rounded-2xl border border-red-500/30 bg-red-500/10 px-5 py-3 flex items-center gap-3">
+          <div className="w-full rounded-2xl border border-amber-500/30 bg-amber-500/10 px-5 py-3 flex items-center gap-3 animate-fade-in">
             <span className="text-lg">⚠️</span>
-            <p className="text-sm font-medium text-red-100">{strikeMsg}</p>
+            <p className="text-sm font-medium text-amber-100">{strikeMsg}</p>
           </div>
         )}
 
-        {/* Loading */}
         {phase === "loading" && (
           <div className="flex flex-col items-center gap-3">
             <div className="w-8 h-8 border-2 border-white/10 border-t-white/50 rounded-full animate-spin" />
@@ -509,7 +605,6 @@ export default function InterviewRoomPage() {
           </div>
         )}
 
-        {/* Begin */}
         {phase === "begin" && (
           <div className="flex flex-col items-center gap-8 text-center max-w-sm">
             <div className="w-20 h-20 rounded-full bg-white/5 border border-white/10 flex items-center justify-center text-4xl">🤖</div>
@@ -518,9 +613,9 @@ export default function InterviewRoomPage() {
               <p className="text-white/40 text-sm leading-relaxed mb-4">
                 The interviewer is strict and direct.<br />
                 Answers are flagged if evasive or incoherent.<br />
-                4 strikes = interview terminated.
+                3 cheating strikes = interview terminated.
               </p>
-              <p className="text-amber-400/80 text-xs font-medium bg-amber-500/10 px-3 py-2 rounded-lg border border-amber-500/20">
+              <p className="text-red-400/80 text-xs font-medium bg-red-500/10 px-3 py-2 rounded-lg border border-red-500/20">
                 🔒 This interview is proctored. You will be locked into full-screen mode.
               </p>
             </div>
@@ -531,10 +626,8 @@ export default function InterviewRoomPage() {
           </div>
         )}
 
-        {/* Active interview */}
         {isActive && current && (
           <>
-            {/* AI avatar */}
             <div className="flex flex-col items-center gap-4">
               <div className="relative">
                 {phase === "ai_speaking" && (
@@ -553,27 +646,23 @@ export default function InterviewRoomPage() {
               </p>
             </div>
 
-            {/* Reaction */}
             {current.reaction && !aiCounter && (
               <p className="text-white/50 text-base italic text-center max-w-md">
-                &quot;{current.reaction}&quot;
+                "{current.reaction}"
               </p>
             )}
 
-            {/* AI counter-response */}
             {aiCounter && (
               <div className="w-full bg-white/5 border border-white/10 rounded-xl p-4 text-center">
                 <p className="text-xs text-white/30 uppercase tracking-widest mb-2">Interviewer replied</p>
-                <p className="text-white/80 text-sm leading-relaxed italic">&quot;{aiCounter}&quot;</p>
+                <p className="text-white/80 text-sm leading-relaxed italic">"{aiCounter}"</p>
               </div>
             )}
 
-            {/* Question */}
             <div className="w-full text-center">
               <p className="text-white text-xl leading-relaxed font-medium">{current.question}</p>
             </div>
 
-            {/* Live transcript */}
             {phase === "recording" && (
               <div className="w-full bg-white/[0.03] border border-white/10 rounded-xl p-4 min-h-[60px]">
                 <p className="text-xs text-white/25 mb-1 uppercase tracking-widest">
@@ -587,33 +676,26 @@ export default function InterviewRoomPage() {
 
             <div className="w-px h-6 bg-white/10" />
 
-            {/* Controls */}
             <div className="flex flex-col items-center gap-4 w-full">
-
               {phase === "recording" && (
                 <div className="flex flex-col items-center w-full animate-fade-in">
-
-                  {/* Recording Status */}
                   <div className="flex items-center gap-2 text-red-400 mb-2">
                     <span className="w-2.5 h-2.5 rounded-full bg-red-500 animate-pulse" />
                     <span className="font-medium tracking-wide">Recording</span>
                     <span className="text-white/30 text-sm font-mono ml-2">{fmt(seconds)}</span>
                   </div>
 
-                  {/* Main Submit */}
                   <button onClick={stopAndSubmit}
                     className="px-8 py-3 bg-white text-black font-bold rounded-full hover:bg-gray-200 transition-all active:scale-95 shadow-lg flex items-center gap-2 mt-2">
                     <span>Submit Answer</span>
                   </button>
 
-                  {/* Keyboard Hint */}
                   <p className="text-white/40 text-xs mt-3">
                     Press <kbd className="px-1.5 py-0.5 bg-white/10 border border-white/20 rounded font-mono mx-0.5">Space</kbd> or <kbd className="px-1.5 py-0.5 bg-white/10 border border-white/20 rounded font-mono mx-0.5">Enter</kbd> to send
                   </p>
 
                   <div className="w-full max-w-[200px] h-px bg-white/10 my-5" />
 
-                  {/* Counter/Pushback Option */}
                   <button onClick={stopAndCounter}
                     className="px-5 py-2 rounded-xl bg-white/5 hover:bg-amber-500/10 border border-white/10 hover:border-amber-400/30 text-white/50 hover:text-amber-300 text-xs font-medium transition-all">
                     ↩ Submit as Pushback / Correction
@@ -642,16 +724,12 @@ export default function InterviewRoomPage() {
           </>
         )}
 
-        {/* Terminated */}
         {phase === "terminated" && (
           <div className="flex flex-col items-center gap-6 text-center max-w-sm">
             <div className="text-5xl">🚫</div>
             <div>
               <h2 className="text-xl font-semibold text-red-400 mb-3">Interview Terminated</h2>
-              <p className="text-white/60 text-sm leading-relaxed italic mb-2">&quot;{termMsg}&quot;</p>
-              {strikeCount > 0 && (
-                 <p className="text-white/30 text-xs">Your responses were flagged {strikeCount} time{strikeCount !== 1 ? "s" : ""}.</p>
-              )}
+              <p className="text-white/60 text-sm leading-relaxed italic mb-2">"{termMsg}"</p>
             </div>
             <div className="flex flex-col gap-3 w-full">
               <button onClick={() => router.push(`/interview/${session_id}/report`)}
@@ -666,7 +744,6 @@ export default function InterviewRoomPage() {
           </div>
         )}
 
-        {/* Done */}
         {phase === "done" && (
           <div className="flex flex-col items-center gap-6 text-center max-w-sm">
             <div className="text-5xl">✓</div>
@@ -680,7 +757,6 @@ export default function InterviewRoomPage() {
             </button>
           </div>
         )}
-
       </main>
     </div>
   );

@@ -8,11 +8,9 @@ const API = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
 // ── Types ─────────────────────────────────────────────────────────────────────
 interface QuestionFeedback {
   question: string;
-  // v8 fields (direct score + critique)
   score?: number;
   critique?: string;
   ideal_answer_snippet?: string;
-  // v6/v7 fallback fields
   answer_quality?: "strong" | "good" | "average" | "weak" | "blank";
   answer_summary?: string;
   comment?: string;
@@ -33,12 +31,10 @@ interface Feedback {
   communication_score: number;
   behaviour_score: number;
   speech_clarity_score: number;
-  // v8
   executive_summary?: string;
   learning_path?: LearningTopic[];
   confidence_calibration?: string;
   confidence_note?: string;
-  // v6 fallbacks
   summary?: string;
   speech_summary?: string;
   recommended_topics?: LearningTopic[];
@@ -47,6 +43,8 @@ interface Feedback {
   behavioral_flags?: BehavioralFlag[];
   question_feedback: QuestionFeedback[];
   speech_analysis?: SpeechAnalysis;
+  penalty_applied?: number;
+  penalty_reason?: string | null;
   score_inputs?: { quality_scores: number[]; avg_fluency: number; strikes: number; idk_ratio: number; avg_word_count: number; };
 }
 
@@ -56,7 +54,9 @@ interface ReportData {
   level: string;
   questions_answered: number;
   misbehavior_count: number;
+  idk_count?: number;
   terminated: boolean;
+  termination_reason?: string | null;
   termination_message: string;
   misbehavior_log: { question: string; reason: string; strike: number }[];
   speech_metrics_log: { question: string; metrics: object }[];
@@ -71,8 +71,12 @@ function getQScore(q: QuestionFeedback): number {
   return QUALITY_SCORE[q.answer_quality ?? "average"] ?? 55;
 }
 
+// FIX: Always derive the label from the numeric score.
+// Previously this prioritised q.answer_quality from the backend, which could
+// disagree with q.score (e.g. backend sent score=20 + answer_quality="blank"
+// because the old score_to_quality_label threshold for "weak" was >=30).
+// Now label and score are always consistent, regardless of what the backend string says.
 function getQLabel(q: QuestionFeedback): string {
-  if (q.answer_quality) return q.answer_quality;
   const s = getQScore(q);
   if (s >= 85) return "strong";
   if (s >= 65) return "good";
@@ -96,7 +100,7 @@ const qualityBg = (q: string) =>
 const scoreLabel = (s: number) =>
   s >= 85 ? "Exceptional" : s >= 70 ? "Proficient" : s >= 55 ? "Developing" : s >= 35 ? "Needs Work" : "Critical Gap";
 
-// ── Score Ring ────────────────────────────────────────────────────────────────
+// ── Components ────────────────────────────────────────────────────────────────
 function ScoreRing({ score, size = 130, stroke = 11, label }: { score: number; size?: number; stroke?: number; label?: string }) {
   const r = (size - stroke) / 2;
   const circ = 2 * Math.PI * r;
@@ -118,7 +122,6 @@ function ScoreRing({ score, size = 130, stroke = 11, label }: { score: number; s
   );
 }
 
-// ── Radar Chart ───────────────────────────────────────────────────────────────
 function RadarChart({ scores }: { scores: { label: string; value: number }[] }) {
   const cx = 140, cy = 140, r = 100;
   const n = scores.length;
@@ -152,7 +155,6 @@ function RadarChart({ scores }: { scores: { label: string; value: number }[] }) 
   );
 }
 
-// ── Score Bar ─────────────────────────────────────────────────────────────────
 function ScoreBar({ label, value, sublabel }: { label: string; value: number; sublabel?: string }) {
   const col = scoreColor(value);
   return (
@@ -174,7 +176,6 @@ function ScoreBar({ label, value, sublabel }: { label: string; value: number; su
   );
 }
 
-// ── Section ───────────────────────────────────────────────────────────────────
 function Section({ title, children, accent, badge }: { title: string; children: React.ReactNode; accent?: string; badge?: string }) {
   return (
     <div style={{ background: "rgba(255,255,255,0.025)", border: "1px solid rgba(255,255,255,0.07)", borderRadius: 18, padding: "26px 30px", marginBottom: 18 }}>
@@ -187,7 +188,6 @@ function Section({ title, children, accent, badge }: { title: string; children: 
   );
 }
 
-// ── Q Score Tile ──────────────────────────────────────────────────────────────
 function QTile({ q, idx, onClick, active }: { q: QuestionFeedback; idx: number; onClick: () => void; active: boolean }) {
   const score = getQScore(q);
   const label = getQLabel(q);
@@ -208,7 +208,6 @@ function QTile({ q, idx, onClick, active }: { q: QuestionFeedback; idx: number; 
   );
 }
 
-// ── Main ──────────────────────────────────────────────────────────────────────
 export default function ReportPage() {
   const { session_id } = useParams<{ session_id: string }>();
   const router = useRouter();
@@ -270,7 +269,11 @@ export default function ReportPage() {
   const qScores = fb.question_feedback?.map(q => getQScore(q)) ?? [];
   const avgQ = qScores.length ? Math.round(qScores.reduce((a, b) => a + b, 0) / qScores.length) : 0;
 
-  // Score distribution summary
+  const penaltyDescription = fb.penalty_applied && fb.penalty_reason
+    ? `A ${fb.penalty_applied}% penalty was applied due to ${fb.penalty_reason === "cheating" ? "cheating" : fb.penalty_reason === "repeated_idk" ? "repeated honest gaps" : fb.penalty_reason === "conduct_strikes" ? "conduct strikes" : fb.penalty_reason}. `
+    : "";
+  const idkDescription = data.idk_count ? `Honest gap count: ${data.idk_count}. ` : "";
+
   const dist: Record<string, number> = {};
   fb.question_feedback?.forEach(q => {
     const l = getQLabel(q);
@@ -322,14 +325,14 @@ export default function ReportPage() {
         {data.terminated && (
           <div style={{ marginBottom: 24, padding: "16px 22px", background: "rgba(239,68,68,0.06)", border: "1px solid rgba(239,68,68,0.2)", borderRadius: 14 }}>
             <p style={{ fontSize: 13, fontWeight: 700, color: "#fca5a5", marginBottom: 4 }}>Interview Terminated</p>
-            <p style={{ fontSize: 13, color: "rgba(255,255,255,0.4)", fontStyle: "italic" }}>&quot;{data.termination_message}&quot;</p>
+            <p style={{ fontSize: 13, color: "rgba(255,255,255,0.4)", fontStyle: "italic", marginBottom: 8 }}>"{data.termination_message}"</p>
+            <p style={{ fontSize: 11, color: "rgba(239,68,68,0.5)", letterSpacing: "0.04em" }}>
+              {penaltyDescription}{idkDescription}{data.misbehavior_count > 0 ? `Behaviour score reflects ${data.misbehavior_count} conduct strike${data.misbehavior_count !== 1 ? "s" : ""}.` : ""}
+            </p>
           </div>
         )}
 
-        {/* ── HERO SCORES ─────────────────────────────────────────────────── */}
         <div style={{ display: "grid", gridTemplateColumns: "280px 1fr", gap: 20, marginBottom: 20 }}>
-
-          {/* Left: ring + radar */}
           <div style={{ background: "rgba(255,255,255,0.025)", border: "1px solid rgba(255,255,255,0.07)", borderRadius: 18, padding: "32px 24px", display: "flex", flexDirection: "column", alignItems: "center", gap: 20 }}>
             <div style={{ textAlign: "center" }}>
               <p style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: "0.14em", color: "rgba(255,255,255,0.25)", marginBottom: 16 }}>Overall Score</p>
@@ -337,7 +340,6 @@ export default function ReportPage() {
               <p style={{ fontSize: 13, color: scoreColor(fb.overall_score), fontWeight: 600, marginTop: 12 }}>{scoreLabel(fb.overall_score)}</p>
             </div>
             <div style={{ width: "100%", height: 1, background: "rgba(255,255,255,0.06)" }} />
-            {/* Confidence calibration */}
             {fb.confidence_calibration && (
               <div style={{ textAlign: "center" }}>
                 <p style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: "0.1em", color: "rgba(255,255,255,0.22)", marginBottom: 6 }}>Confidence</p>
@@ -354,7 +356,6 @@ export default function ReportPage() {
             <RadarChart scores={radarScores} />
           </div>
 
-          {/* Right: dimension bars + score input debug */}
           <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
             <div style={{ background: "rgba(255,255,255,0.025)", border: "1px solid rgba(255,255,255,0.07)", borderRadius: 18, padding: "26px 28px", flex: 1 }}>
               <p style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: "0.14em", color: "rgba(255,255,255,0.3)", marginBottom: 20 }}>Performance Dimensions</p>
@@ -365,7 +366,6 @@ export default function ReportPage() {
               <ScoreBar label="Speech Clarity" value={fb.speech_clarity_score} sublabel={fb.speech_analysis ? `fluency ${fb.speech_analysis.avg_fluency_score}/100` : undefined} />
             </div>
 
-            {/* Formula breakdown */}
             <div style={{ background: "rgba(99,102,241,0.04)", border: "1px solid rgba(99,102,241,0.15)", borderRadius: 14, padding: "18px 22px" }}>
               <p style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: "0.14em", color: "rgba(99,102,241,0.6)", marginBottom: 14 }}>Scoring Formula</p>
               <div style={{ display: "flex", gap: 6, flexWrap: "wrap", alignItems: "center" }}>
@@ -376,14 +376,14 @@ export default function ReportPage() {
                   { l: "Behaviour", w: "15%", v: fb.behaviour_score },
                   { l: "Speech", w: "15%", v: fb.speech_clarity_score },
                 ].map((item, i, arr) => (
-                  <>
-                    <div key={i} style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 3, padding: "8px 12px", background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.07)", borderRadius: 10, minWidth: 72 }}>
+                  <div key={i} style={{ display: "contents" }}>
+                    <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 3, padding: "8px 12px", background: "rgba(255,255,255,0.03)", border: "1px solid rgba(255,255,255,0.07)", borderRadius: 10, minWidth: 72 }}>
                       <span style={{ fontSize: 17, fontWeight: 800, color: scoreColor(item.v), letterSpacing: "-0.02em" }}>{item.v}</span>
                       <span style={{ fontSize: 9, color: "rgba(255,255,255,0.4)", textAlign: "center" }}>{item.l}</span>
                       <span style={{ fontSize: 9, color: "rgba(255,255,255,0.22)", fontFamily: "'DM Mono', monospace" }}>×{item.w}</span>
                     </div>
                     {i < arr.length - 1 && <span style={{ color: "rgba(255,255,255,0.18)", fontSize: 16 }}>+</span>}
-                  </>
+                  </div>
                 ))}
                 <span style={{ color: "rgba(255,255,255,0.18)", fontSize: 16 }}>=</span>
                 <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 3, padding: "8px 16px", background: "rgba(99,102,241,0.12)", border: "1px solid rgba(99,102,241,0.3)", borderRadius: 10 }}>
@@ -395,7 +395,6 @@ export default function ReportPage() {
           </div>
         </div>
 
-        {/* ── EXECUTIVE SUMMARY ────────────────────────────────────────────── */}
         <Section title="Executive Assessment">
           <p style={{ fontSize: 15, color: "rgba(255,255,255,0.72)", lineHeight: 1.8, fontWeight: 400 }}>{summary}</p>
           {fb.speech_summary && (
@@ -429,9 +428,7 @@ export default function ReportPage() {
           </div>
         </div>
 
-        {/* ── QUESTION PERFORMANCE OVERVIEW ────────────────────────────────── */}
         <Section title="Answer Quality Overview" badge={`${qScores.length} questions · avg ${avgQ}/100`}>
-          {/* Distribution bar */}
           <div style={{ marginBottom: 20 }}>
             <div style={{ display: "flex", height: 8, borderRadius: 4, overflow: "hidden", gap: 2 }}>
               {["strong", "good", "average", "weak", "blank"].map(label => {
@@ -455,12 +452,10 @@ export default function ReportPage() {
             </div>
           </div>
 
-          {/* Q tiles */}
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap", marginBottom: 16 }}>
             {fb.question_feedback?.map((q, i) => (
               <QTile key={i} q={q} idx={i} active={openQs.has(i)} onClick={() => openFromTile(i)} />
             ))}
-            {/* Avg tile */}
             <div style={{ display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: 4, padding: "12px 14px", background: "rgba(99,102,241,0.08)", border: "1px solid rgba(99,102,241,0.2)", borderRadius: 12, minWidth: 72 }}>
               <span style={{ fontSize: 20, fontWeight: 800, color: scoreColor(avgQ), letterSpacing: "-0.02em" }}>{avgQ}</span>
               <span style={{ fontSize: 9, color: "rgba(255,255,255,0.3)", textTransform: "uppercase", letterSpacing: "0.06em" }}>Avg</span>
@@ -472,7 +467,6 @@ export default function ReportPage() {
           </p>
         </Section>
 
-        {/* ── QUESTION-BY-QUESTION BREAKDOWN ───────────────────────────────── */}
         <div ref={breakdownRef}>
         <Section title="Detailed Question Analysis" badge={`${fb.question_feedback?.length ?? 0} questions`}>
           <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 16, marginTop: -8 }}>
@@ -492,14 +486,12 @@ export default function ReportPage() {
 
             return (
               <div key={i} style={{ marginBottom: 10, borderRadius: 14, overflow: "hidden", border: `1px solid ${isOpen ? col + "40" : "rgba(255,255,255,0.06)"}`, transition: "border-color 0.2s ease" }}>
-                {/* Question header — always visible */}
                 <button onClick={() => toggleQ(i)} style={{
                   width: "100%", padding: "16px 20px", display: "flex", alignItems: "flex-start", gap: 14,
                   background: isOpen ? qualityBg(label) : "rgba(255,255,255,0.02)",
                   border: "none", cursor: "pointer", textAlign: "left",
                   transition: "background 0.2s ease",
                 }}>
-                  {/* Score badge */}
                   <div style={{ display: "flex", flexDirection: "column", alignItems: "center", gap: 2, minWidth: 52, flexShrink: 0, paddingTop: 2 }}>
                     <span style={{ fontSize: 20, fontWeight: 800, color: col, letterSpacing: "-0.02em", lineHeight: 1 }}>{score}</span>
                     <span style={{ fontSize: 9, color: col, textTransform: "capitalize", opacity: 0.8 }}>{label}</span>
@@ -510,10 +502,9 @@ export default function ReportPage() {
                       {q.question}
                     </p>
                     {answerSummary && (
-                      <p style={{ fontSize: 12, color: "rgba(255,255,255,0.32)", lineHeight: 1.5, fontStyle: "italic" }}>&quot;{answerSummary}&quot;</p>
+                      <p style={{ fontSize: 12, color: "rgba(255,255,255,0.32)", lineHeight: 1.5, fontStyle: "italic" }}>"{answerSummary}"</p>
                     )}
                   </div>
-                  {/* Fluency mini bar */}
                   {fb.speech_analysis?.per_question?.[i] && (
                     <div style={{ flexShrink: 0, display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 3 }}>
                       <span style={{ fontSize: 9, color: "rgba(255,255,255,0.25)", textTransform: "uppercase", letterSpacing: "0.06em" }}>fluency</span>
@@ -525,11 +516,9 @@ export default function ReportPage() {
                   <span style={{ fontSize: 11, color: "rgba(255,255,255,0.2)", flexShrink: 0, marginTop: 4 }}>{isOpen ? "▲" : "▼"}</span>
                 </button>
 
-                {/* Expanded detail */}
                 {isOpen && (
                   <div style={{ background: "rgba(0,0,0,0.25)", padding: "22px 22px 22px 86px", display: "flex", flexDirection: "column", gap: 18 }}>
 
-                    {/* Critique */}
                     {critique && (
                       <div>
                         <p style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: "0.12em", color: "rgba(255,255,255,0.25)", marginBottom: 8, fontFamily: "'DM Mono', monospace" }}>Evaluator Critique</p>
@@ -537,7 +526,6 @@ export default function ReportPage() {
                       </div>
                     )}
 
-                    {/* What you should have said */}
                     {idealSnippet && (
                       <div style={{ padding: "16px 18px", background: "rgba(99,102,241,0.07)", border: "1px solid rgba(99,102,241,0.18)", borderRadius: 12 }}>
                         <p style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: "0.12em", color: "#818cf8", marginBottom: 10, fontFamily: "'DM Mono', monospace" }}>Model Answer Approach</p>
@@ -545,7 +533,6 @@ export default function ReportPage() {
                       </div>
                     )}
 
-                    {/* Ideal points */}
                     {idealPoints.length > 0 && (
                       <div>
                         <p style={{ fontSize: 10, textTransform: "uppercase", letterSpacing: "0.12em", color: "rgba(255,255,255,0.25)", marginBottom: 10, fontFamily: "'DM Mono', monospace" }}>Key Points to Cover</p>
@@ -559,7 +546,6 @@ export default function ReportPage() {
                       </div>
                     )}
 
-                    {/* Speech stats for this Q */}
                     {fb.speech_analysis?.per_question?.[i] && (
                       <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
                         {[
@@ -581,7 +567,6 @@ export default function ReportPage() {
                       </div>
                     )}
 
-                    {/* Study topic */}
                     {q.study_topic && (
                       <div style={{ display: "flex", alignItems: "center", gap: 10, padding: "10px 14px", background: "rgba(251,191,36,0.06)", border: "1px solid rgba(251,191,36,0.18)", borderRadius: 10 }}>
                         <span style={{ fontSize: 15 }}>📚</span>
@@ -617,11 +602,9 @@ export default function ReportPage() {
             </div>
           </Section>
         )}
-
-
         </div>
 
-                {/* ── SPEECH ANALYSIS ──────────────────────────────────────────────── */}
+        {/* ── SPEECH ANALYSIS ──────────────────────────────────────────────── */}
         {fb.speech_analysis && (
           <Section title="Speech & Fluency">
             <div style={{ display: "grid", gridTemplateColumns: "repeat(4, 1fr)", gap: 10, marginBottom: 22 }}>
@@ -643,7 +626,7 @@ export default function ReportPage() {
                 <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
                   {fb.speech_analysis.top_filler_words.map((fw, i) => (
                     <span key={i} style={{ fontSize: 12, padding: "5px 14px", background: "rgba(249,115,22,0.08)", border: "1px solid rgba(249,115,22,0.2)", borderRadius: 20, color: "#f97316", fontFamily: "'DM Mono', monospace" }}>
-                      &quot;{fw.word}&quot; ×{fw.count}
+                      "{fw.word}" ×{fw.count}
                     </span>
                   ))}
                 </div>
@@ -677,7 +660,7 @@ export default function ReportPage() {
                 <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 6 }}>
                   <span style={{ fontSize: 9, padding: "2px 9px", background: "rgba(248,113,113,0.12)", borderRadius: 20, color: "#fca5a5", textTransform: "uppercase", fontWeight: 700, letterSpacing: "0.08em" }}>{flag.type}</span>
                 </div>
-                <p style={{ fontSize: 12, color: "rgba(255,255,255,0.4)", marginBottom: 6, fontStyle: "italic" }}>&quot;{flag.question}&quot;</p>
+                <p style={{ fontSize: 12, color: "rgba(255,255,255,0.4)", marginBottom: 6, fontStyle: "italic" }}>"{flag.question}"</p>
                 <p style={{ fontSize: 13, color: "rgba(255,255,255,0.6)", lineHeight: 1.6 }}>{flag.note}</p>
               </div>
             ))}
@@ -687,17 +670,25 @@ export default function ReportPage() {
         {/* ── STRIKE LOG ───────────────────────────────────────────────────── */}
         {data.misbehavior_log?.length > 0 && (
           <Section title="Strike Log" accent="#f87171">
-            {data.misbehavior_log.map((m, i) => (
-              <div key={i} style={{ display: "flex", gap: 14, alignItems: "flex-start", marginBottom: 12 }}>
-                <div style={{ width: 26, height: 26, borderRadius: "50%", background: "rgba(239,68,68,0.12)", border: "1px solid rgba(239,68,68,0.3)", display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
-                  <span style={{ fontSize: 11, fontWeight: 800, color: "#f87171" }}>{m.strike}</span>
+            {data.misbehavior_log.map((m, i) => {
+              const isCheat = m.reason.includes("cheat") || m.reason.includes("fullscreen");
+              const themeColor = isCheat ? "#f87171" : "#fbbf24";
+              const bgColor = isCheat ? "rgba(239,68,68,0.12)" : "rgba(251,191,36,0.12)";
+              const borderColor = isCheat ? "rgba(239,68,68,0.3)" : "rgba(251,191,36,0.3)";
+              const textColor = isCheat ? "#fca5a5" : "#fcd34d";
+
+              return (
+                <div key={i} style={{ display: "flex", gap: 14, alignItems: "flex-start", marginBottom: 12 }}>
+                  <div style={{ width: 26, height: 26, borderRadius: "50%", background: bgColor, border: `1px solid ${borderColor}`, display: "flex", alignItems: "center", justifyContent: "center", flexShrink: 0 }}>
+                    <span style={{ fontSize: 11, fontWeight: 800, color: themeColor }}>{m.strike}</span>
+                  </div>
+                  <div>
+                    <p style={{ fontSize: 13, color: textColor, fontWeight: 600, textTransform: "capitalize" }}>{m.reason}</p>
+                    <p style={{ fontSize: 12, color: "rgba(255,255,255,0.3)", marginTop: 3 }}>{m.question}</p>
+                  </div>
                 </div>
-                <div>
-                  <p style={{ fontSize: 13, color: "#fca5a5", fontWeight: 600 }}>{m.reason}</p>
-                  <p style={{ fontSize: 12, color: "rgba(255,255,255,0.3)", marginTop: 3 }}>{m.question}</p>
-                </div>
-              </div>
-            ))}
+              );
+            })}
           </Section>
         )}
 

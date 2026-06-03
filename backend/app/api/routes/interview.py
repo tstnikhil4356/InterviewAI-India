@@ -1,11 +1,9 @@
 """
-interview.py — Fixed & Enhanced v5
-Fixes:
-  1. Solved the "previous-to-previous" question bug by passing the full `session["history"]`.
-  2. Replaced fragile .splitlines() with robust Regex in the /counter endpoint.
-  3. Gracefully handles STT misinterpretations (e.g., hearing "Chef" instead of "SHAP").
-  4. /end now accepts a termination 'reason' from the frontend anti-cheat.
-  5. /report now gracefully returns a blank report instead of a 400 error if terminated early.
+interview.py — Production v12.3
+
+Changes vs v12.2:
+  1. Fixed idk_count sync: elif -> standalone if with `is not None` check,
+     so a count of 0 (after reset or on first answer) no longer silently drops.
 """
 
 import json
@@ -20,14 +18,14 @@ from app.services.resume_parser import parse_resume
 from app.services.question_engine import (
     generate_first_question,
     generate_follow_up,
-    build_coverage,
-    pick_next_target,
-    _detect_topic,
-    STRIKE_WARNINGS,
-    MAX_MISBEHAVIOR,
+    generate_replacement_question,
 )
 from app.services.feedback_engine import generate_feedback
 from app.services.groq_client import transcribe, text_to_speech
+
+# ── v10: Transcription Normalizer ─────────────────────────────────────────────
+from app.services.transcription_normalizer import normalize_transcript, build_stt_prompt
+
 from app.core.config import settings
 
 router = APIRouter()
@@ -68,45 +66,6 @@ def get_session(session_id: str) -> dict:
     return s
 
 
-def _format_cheat_warning(count: int) -> str:
-    if count <= 0:
-        return ""
-    return STRIKE_WARNINGS[min(count - 1, len(STRIKE_WARNINGS) - 1)] + " "
-
-
-def _generate_next_question_after_cheat(session: dict) -> tuple[str, str]:
-    current_question = session.get("current_question", "")
-    resume_data = session["resume_data"]
-    history = session["history"]
-    last_topic = _detect_topic(current_question, resume_data)
-
-    coverage = build_coverage(resume_data, history)
-    next_target = pick_next_target(
-        coverage=coverage,
-        questions_asked=len(history),
-        history=history,
-        resume_data=resume_data,
-        force_skip_label=last_topic if last_topic else None,
-    )
-
-    next_question = next_target["instruction"]
-    warning = _format_cheat_warning(session.get("misbehavior_count", 0))
-    reaction = f"{warning}You left the interview. Let's continue with a new question."
-    return next_question, reaction
-
-
-def _register_cheat_event(session: dict, reason: str = "Tab switch or full-screen exit detected.") -> int:
-    count = session.get("misbehavior_count", 0) + 1
-    session["misbehavior_count"] = count
-    session["misbehavior_log"].append({
-        "question": session.get("current_question", "<unknown>"),
-        "reason": reason,
-        "strike": count,
-    })
-    session.setdefault("cheat_events", []).append({"reason": reason, "strike": count})
-    return count
-
-
 # ── Speech metrics ─────────────────────────────────────────────────────────────
 FILLER_WORDS = [
     "um", "uh", "uhh", "umm", "like", "you know", "basically", "actually",
@@ -116,38 +75,39 @@ FILLER_WORDS = [
 
 
 def compute_speech_metrics(text: str) -> dict:
-    if not text or len(text.strip()) < 3:
+    t = text.lower().strip()
+
+    hallucinations = [
+        "thank you.", "thank you", "thanks for watching.", "thanks for watching",
+        "amara.org", "subscribe.", "bye.", "bye",
+    ]
+
+    if not t or len(t) < 3 or t == "[no response]" or "forfeited" in t or t in hallucinations:
         return {
             "word_count": 0, "filler_count": 0, "filler_words_found": [],
             "repeated_words": [], "too_short": True, "too_long": False,
             "fluency_score": 0, "avg_sentence_length": 0,
         }
 
-    lower = text.lower()
-    words = lower.split()
+    words = t.split()
     word_count = len(words)
 
-    # Filler detection
     filler_found: list[str] = []
     filler_count = 0
     for filler in FILLER_WORDS:
         pattern = r'\b' + re.escape(filler) + r'\b'
-        matches = re.findall(pattern, lower)
+        matches = re.findall(pattern, t)
         if matches:
             filler_count += len(matches)
             filler_found.append(filler)
 
-    # Stutter / repeated consecutive words
     repeated: list[str] = []
     for i in range(len(words) - 1):
         if words[i] == words[i + 1] and len(words[i]) > 2:
             repeated.append(words[i])
 
-    # Sentence count for avg sentence length
     sentences = [s.strip() for s in re.split(r'[.!?]+', text) if s.strip()]
     avg_sentence_length = word_count / max(len(sentences), 1)
-
-    # Fluency score: starts at 100, penalise fillers and repeats
     fluency = max(0, min(100, 100 - (filler_count * 4) - (len(set(repeated)) * 6)))
 
     return {
@@ -159,6 +119,77 @@ def compute_speech_metrics(text: str) -> dict:
         "too_long": word_count > 350,
         "fluency_score": fluency,
         "avg_sentence_length": round(avg_sentence_length, 1),
+    }
+
+
+# ── Anti-Cheat (Fullscreen Exits) ─────────────────────────────────────────────
+
+class FullscreenViolationRequest(BaseModel):
+    session_id: str
+
+
+@router.post("/fullscreen-violation")
+async def fullscreen_violation(body: FullscreenViolationRequest):
+    session = get_session(body.session_id)
+    if session["status"] != "active":
+        raise HTTPException(400, "Interview is not active")
+
+    cheat_count = session.get("cheat_count", 0) + 1
+    session["cheat_count"] = cheat_count
+
+    session["misbehavior_log"].append({
+        "question": session["current_question"],
+        "reason":   "exited_fullscreen (cheat attempt)",
+        "strike":   cheat_count,
+    })
+    session["counter_turns"] = []
+
+    if cheat_count >= 3:
+        session["status"] = "terminated"
+        session["terminated"] = True
+        session["termination_reason"] = "cheating"
+        session["termination_message"] = (
+            "Interview terminated due to repeated tab switching or exiting fullscreen."
+        )
+        save_session(body.session_id, session)
+
+        audio_b64 = await text_to_speech(session["termination_message"])
+        return {
+            "done": True,
+            "terminated": True,
+            "termination_reason": "cheating",
+            "termination_message": session["termination_message"],
+            "misbehavior_count": cheat_count,
+            "audio_b64": audio_b64,
+        }
+
+    next_q = generate_replacement_question(
+        session["resume_data"],
+        session["history"],
+        session["current_question"],
+    )
+
+    reaction = (
+        "I noticed you left the interview screen. "
+        "Please stay in full-screen mode. Let's move to a different topic."
+    )
+    spoken    = f"{reaction} {next_q}".strip()
+    audio_b64 = await text_to_speech(spoken)
+
+    session["current_question"] = next_q
+    session["current_reaction"] = reaction
+    save_session(body.session_id, session)
+
+    return {
+        "done": False,
+        "terminated": False,
+        "reaction": reaction,
+        "question": next_q,
+        "question_number": session["question_count"],
+        "audio_b64": audio_b64,
+        "strike_issued": True,
+        "misbehavior_count": cheat_count,
+        "answer_quality": "screen_exit",
     }
 
 
@@ -179,19 +210,40 @@ async def speak(body: SpeakRequest):
 
 
 # ── Transcribe ─────────────────────────────────────────────────────────────────
+# v10 CHANGE — Two-step pipeline:
+#   Step 1: Send audio to Groq/Whisper → raw transcript
+#   Step 2: normalize_transcript() fixes static mishearings (e.g. Enet10 → n8n)
+#
+# This endpoint does NOT have access to resume_data (no session context here),
+# so only the static glossary is applied. The resume-aware second pass happens
+# in /next-question where resume_data is available.
 
 @router.post("/transcribe")
 async def transcribe_audio(audio: UploadFile = File(...)):
     audio_bytes = await audio.read()
-    if not audio_bytes:
-        raise HTTPException(400, "Empty audio file")
+
+    if not audio_bytes or len(audio_bytes) < 500:
+        print(
+            f"[STT] Audio file too small "
+            f"({len(audio_bytes) if audio_bytes else 0} bytes), treating as blank."
+        )
+        return {"transcript": "[no response]"}
+
     try:
-        text = transcribe(audio_bytes, filename=audio.filename or "answer.webm")
-        print(f"[STT] Transcribed: {text[:100]}")
+        raw_text = transcribe(audio_bytes, filename=audio.filename or "answer.webm")
+        print(f"[STT] Raw transcript: {raw_text[:120]}")
+
+        # v10: Layer 2 static normalization
+        clean_text = normalize_transcript(raw_text, resume_data=None)
+
+        if clean_text != raw_text:
+            print(f"[STT NORM] Fixed: {raw_text[:80]} → {clean_text[:80]}")
+
+        return {"transcript": clean_text}
+
     except Exception as e:
         print(f"[STT ERROR] {e}")
-        raise HTTPException(500, f"Transcription failed: {e}")
-    return {"transcript": text}
+        return {"transcript": "[no response]"}
 
 
 # ── Start interview ────────────────────────────────────────────────────────────
@@ -211,90 +263,42 @@ async def start_interview(
         raise HTTPException(422, resume_data["error"])
 
     first_question = generate_first_question(resume_data, role, level)
-    session_id = str(uuid.uuid4())
+    session_id     = str(uuid.uuid4())
 
     session = {
-        "resume_data": resume_data,
-        "role": role,
-        "level": level,
-        "history": [],
-        "current_question": first_question,
-        "current_reaction": "",
-        "question_count": 1,
-        "status": "active",
-        "counter_turns": [],
-        "misbehavior_count": 0,
-        "misbehavior_log": [],
-        "cheat_events": [],
-        "skip_current_question": False,
-        "terminated": False,
+        "resume_data":         resume_data,
+        "role":                role,
+        "level":               level,
+        "history":             [],
+        "current_question":    first_question,
+        "current_reaction":    "",
+        "question_count":      1,
+        "status":              "active",
+        "counter_turns":       [],
+        "cheat_count":         0,
+        "evasive_count":       0,
+        "idk_count":           0,
+        "misbehavior_log":     [],
+        "terminated":          False,
         "termination_message": "",
-        "speech_metrics_log": [],
+        "termination_reason":  None,
+        "speech_metrics_log":  [],
     }
     _sessions[session_id] = session
     save_session(session_id, session)
 
+    # v11 FIX: pre-generate TTS audio for the first question here so the
+    # interview room can play it immediately without a second /speak roundtrip.
+    # This is the same pattern /next-question and /fullscreen-violation use.
+    # The setup page stores audio_b64 in sessionStorage and the interview room
+    # reads it in speakTurn, keeping the audio-end → mic-open gap predictable.
+    first_audio_b64 = await text_to_speech(first_question)
+
     return {
-        "session_id": session_id,
-        "question": first_question,
+        "session_id":      session_id,
+        "question":        first_question,
         "question_number": 1,
-    }
-
-
-class CheatRequest(BaseModel):
-    session_id: str
-
-
-@router.post("/cheat")
-async def report_cheat(body: CheatRequest):
-    session = get_session(body.session_id)
-    if session["status"] != "active":
-        raise HTTPException(400, "Interview is not active")
-
-    new_count = _register_cheat_event(session)
-    save_session(body.session_id, session)
-
-    if new_count >= MAX_MISBEHAVIOR:
-        session["status"] = "terminated"
-        session["terminated"] = True
-        session["termination_message"] = (
-            "Interview automatically terminated due to repeated tab switches or exiting full-screen."
-        )
-        save_session(body.session_id, session)
-        audio_b64 = await text_to_speech(session["termination_message"])
-        return {
-            "terminated": True,
-            "termination_message": session["termination_message"],
-            "misbehavior_count": new_count,
-            "audio_b64": audio_b64,
-        }
-
-    # Skip the current question after the cheat event.
-    skipped_question = session.get("current_question", "")
-    session["history"].append({
-        "question": skipped_question,
-        "answer": "[skipped due to tab switch/full-screen exit]",
-        "speech_metrics": compute_speech_metrics(""),
-        "cheat_skip": True,
-    })
-
-    next_q, reaction = _generate_next_question_after_cheat(session)
-    session["current_question"] = next_q
-    session["current_reaction"] = reaction
-    session["question_count"] = session.get("question_count", 1) + 1
-    session["skip_current_question"] = False
-    save_session(body.session_id, session)
-
-    audio_b64 = await text_to_speech(f"{reaction} {next_q}".strip())
-    return {
-        "done": False,
-        "terminated": False,
-        "reaction": reaction,
-        "question": next_q,
-        "question_number": session["question_count"],
-        "audio_b64": audio_b64,
-        "strike_issued": True,
-        "misbehavior_count": new_count,
+        "audio_b64":       first_audio_b64,
     }
 
 
@@ -311,130 +315,138 @@ async def next_question(body: NextQuestionRequest):
     if session["status"] != "active":
         raise HTTPException(400, "Interview is not active")
 
-    if session.get("skip_current_question"):
-        session["skip_current_question"] = False
-        skipped_question = session.get("current_question", "")
-        session["history"].append({
-            "question": skipped_question,
-            "answer": "[skipped due to tab switch/full-screen exit]",
-            "speech_metrics": compute_speech_metrics(""),
-            "cheat_skip": True,
-        })
-        next_q, reaction = _generate_next_question_after_cheat(session)
-        session["current_question"] = next_q
-        session["current_reaction"] = reaction
-        session["question_count"] = session.get("question_count", 1) + 1
-        session["counter_turns"] = []
-        save_session(body.session_id, session)
-        audio_b64 = await text_to_speech(f"{reaction} {next_q}".strip())
-        return {
-            "done": False,
-            "terminated": False,
-            "reaction": reaction,
-            "question": next_q,
-            "question_number": session["question_count"],
-            "audio_b64": audio_b64,
-            "strike_issued": False,
-            "misbehavior_count": session.get("misbehavior_count", 0),
-            "answer_quality": "ok",
-        }
+    # v10: Layer 2 resume-aware normalization
+    clean_transcript = normalize_transcript(
+        body.transcript,
+        resume_data=session["resume_data"],
+    )
+    if clean_transcript != body.transcript:
+        print(
+            f"[NORM resume-aware] "
+            f"{body.transcript[:60]} → {clean_transcript[:60]}"
+        )
 
-    # Compute speech metrics for this answer
-    speech = compute_speech_metrics(body.transcript)
+    speech = compute_speech_metrics(clean_transcript)
     session["speech_metrics_log"].append({
         "question": session["current_question"],
-        "metrics": speech,
+        "metrics":  speech,
     })
 
-    # Save current answer to history
     session["history"].append({
-        "question": session["current_question"],
-        "answer": body.transcript,
+        "question":       session["current_question"],
+        "answer":         clean_transcript,
         "speech_metrics": speech,
+        "answer_quality": "pending",
     })
     session["counter_turns"] = []
 
-    misbehavior_count: int = session.get("misbehavior_count", 0)
+    evasive_count: int = session.get("evasive_count", 0)
+    idk_count: int     = session.get("idk_count", 0)
 
     result = generate_follow_up(
         resume_data=session["resume_data"],
         role=session["role"],
         level=session["level"],
         history=session["history"],
-        misbehavior_count=misbehavior_count,
+        misbehavior_count=evasive_count,
+        idk_count=idk_count,
     )
 
-    # ── Termination by interviewer ─────────────────────────────────────────
-    if result is not None and result.get("terminated"):
-        session["misbehavior_count"] = misbehavior_count + 1
-        session["misbehavior_log"].append({
-            "question": session["current_question"],
-            "reason": result.get("answer_quality", "unacceptable"),
-            "strike": session["misbehavior_count"],
-        })
-        session["status"] = "terminated"
-        session["terminated"] = True
-        session["termination_message"] = result.get("reaction", "Interview terminated.")
-        save_session(body.session_id, session)
+    if result is not None:
+        session["history"][-1]["answer_quality"] = result.get("answer_quality", "ok")
+    else:
+        session["history"][-1]["answer_quality"] = "ok"
 
-        # TTS the termination message
-        audio_b64 = await text_to_speech(result["reaction"])
-        return {
-            "done": True,
-            "terminated": True,
-            "termination_message": result["reaction"],
-            "misbehavior_count": session["misbehavior_count"],
-            "audio_b64": audio_b64,
-        }
-
-    # ── Natural end ───────────────────────────────────────────────────────
     if result is None:
         session["status"] = "completed"
         save_session(body.session_id, session)
         return {"done": True, "terminated": False}
 
-    # ── Misbehavior strike (non-terminal) ──────────────────────────────────
+    if result.get("idk_count") is not None:
+        session["idk_count"] = result["idk_count"]
+
+    if result.get("termination_reason") == "repeated_idk":
+        session["status"] = "terminated"
+        session["terminated"] = True
+        session["termination_reason"] = "repeated_idk"
+        session["termination_message"] = (
+            "Interview terminated due to repeated 'I don't know' responses without attempting to reason."
+        )
+        save_session(body.session_id, session)
+        audio_b64 = await text_to_speech(session["termination_message"])
+        return {
+            "done": True,
+            "terminated": True,
+            "termination_message": session["termination_message"],
+            "termination_reason": "repeated_idk",
+            "audio_b64": audio_b64,
+        }
+
+    if result.get("terminated") and result.get("termination_reason") == "conduct_strikes":
+        evasive_count = result.get("misbehavior_count", evasive_count + 1)
+        session["evasive_count"] = evasive_count
+        session["status"] = "terminated"
+        session["terminated"] = True
+        session["termination_reason"] = "conduct_strikes"
+        session["termination_message"] = result.get("reaction", "Interview terminated.")
+        save_session(body.session_id, session)
+        audio_b64 = await text_to_speech(session["termination_message"])
+        return {
+            "done": True,
+            "terminated": True,
+            "termination_message": session["termination_message"],
+            "termination_reason": "conduct_strikes",
+            "audio_b64": audio_b64,
+        }
+
     answer_quality = result.get("answer_quality", "ok")
-    is_misbehavior = answer_quality in ("gibberish", "evasive")
-    strike_issued = False
-    new_strike_count = misbehavior_count
+
+    is_misbehavior = answer_quality in ("gibberish", "evasive", "rude", "fabricated")
+    strike_issued  = False
 
     if is_misbehavior:
-        new_strike_count = misbehavior_count + 1
-        session["misbehavior_count"] = new_strike_count
+        evasive_count += 1
+        session["evasive_count"] = evasive_count
+
+        strike_reason = {
+            "rude":       "hostile/unprofessional answer",
+            "fabricated": "fabricated/invented experience",
+            "evasive":    "evasive answer",
+            "gibberish":  "incoherent/gibberish answer",
+        }.get(answer_quality, f"{answer_quality} answer")
+
         session["misbehavior_log"].append({
             "question": session["current_question"],
-            "reason": answer_quality,
-            "strike": new_strike_count,
+            "reason":   strike_reason,
+            "strike":   evasive_count,
         })
         strike_issued = True
-        print(f"[STRIKE] {new_strike_count}/4 — answer was {answer_quality}")
 
-    reaction = result.get("reaction", "")
-    next_q   = result.get("question", "")
-    spoken   = f"{reaction} {next_q}".strip() if reaction else next_q
-
+    reaction  = result.get("reaction", "")
+    next_q    = result.get("question", "")
+    spoken    = f"{reaction} {next_q}".strip() if reaction else next_q
     audio_b64 = await text_to_speech(spoken)
 
     session["current_question"] = next_q
     session["current_reaction"] = reaction
-    session["question_count"] += 1
+    session["question_count"]  += 1
     save_session(body.session_id, session)
 
     return {
-        "done": False,
-        "terminated": False,
-        "reaction": reaction,
-        "question": next_q,
-        "question_number": session["question_count"],
-        "audio_b64": audio_b64,
-        "strike_issued": strike_issued,
-        "misbehavior_count": new_strike_count,
-        "answer_quality": answer_quality,
+        "done":              False,
+        "terminated":        False,
+        "reaction":          reaction,
+        "question":          next_q,
+        "question_number":   session["question_count"],
+        "audio_b64":         audio_b64,
+        "strike_issued":     strike_issued,
+        "misbehavior_count": evasive_count,
+        "answer_quality":    answer_quality,
+        "idk_count":         session.get("idk_count", 0),
     }
 
 
-# ── Counter (pushback on AI reaction) ─────────────────────────────────────────
+# ── Counter ────────────────────────────────────────────────────────────────────
 
 class CounterRequest(BaseModel):
     session_id: str
@@ -451,59 +463,42 @@ async def counter(body: CounterRequest):
     turns.append({"role": "candidate", "text": body.counter_text})
     session["counter_turns"] = turns
 
-    max_counters = 2
+    max_counters  = 2
     force_move_on = len(turns) >= max_counters * 2
 
     from app.services.groq_client import chat
 
     context = f"""You are a senior technical interviewer. You are firm and direct, but FAIR and REASONABLE.
-You just asked: "{session['current_question']}"  
-Your previous reaction was: "{session['current_reaction']}"  
-The candidate pushed back with: "{body.counter_text}"  
-Counter exchange: {len(turns)} message(s)  
-Force move on: {force_move_on}  
+You just asked: "{session['current_question']}"
+Your previous reaction was: "{session['current_reaction']}"
+The candidate pushed back with: "{body.counter_text}"
+Counter exchange: {len(turns)} message(s)
+Force move on: {force_move_on}
 
-CRITICAL RULE ON CORRECTIONS: 
-This interview uses a Speech-to-Text engine. It frequently mishears technical terms (e.g., hearing "Chef" instead of "SHAP", "React" instead of "Read that", etc.). 
+CRITICAL RULE ON CORRECTIONS:
+This interview uses a Speech-to-Text engine. It frequently mishears technical terms.
 If the candidate is correcting a misheard word or clarifying a misunderstanding:
 1. Accept the correction instantly and gracefully.
-2. Acknowledge the mix-up in ONE brief sentence (e.g., "Ah, my mistake, the audio cut out. Tell me about SHAP then.").
-3. ACTION must be 'repeat_question' (rephrased using their corrected term) OR 'move_on'.
-Do NOT accuse them of changing their story or lying if it is clearly a phonetic STT error.
+2. Acknowledge the mix-up in ONE brief sentence.
+3. ACTION must be 'repeat_question' OR 'move_on'.
 
-However, if they are genuinely deflecting, stalling, or refusing to answer (and not correcting a typo), call it out directly and firmly.
-
-{"Since this has gone on long enough, firmly shut it down and move to the next topic." if force_move_on else ""}  
-
-RULES:
-- Maximum 2 sentences.
-- Speak naturally and conversationally.
-- Never use the word "acknowledge" or "capitulate". Just speak normally.
-
-Respond with ONLY:  
-RESPONSE: [your reply]  
-ACTION: repeat_question OR move_on  
+Respond with ONLY:
+RESPONSE: [your reply]
+ACTION: repeat_question OR move_on
 """
 
     raw = chat([{"role": "user", "content": context}], temperature=0.6)
 
-    # 1. Determine the action safely, no matter where it is in the string
     action = "move_on"
     if "REPEAT_QUESTION" in raw.upper():
         action = "repeat_question"
 
-    # 2. Strip out the internal instruction tags using Regex
-    clean_text = raw
-    clean_text = re.sub(r'ACTION:\s*(repeat_question|move_on)', '', clean_text, flags=re.IGNORECASE)
+    clean_text = re.sub(r'ACTION:\s*(repeat_question|move_on)', '', raw, flags=re.IGNORECASE)
     clean_text = re.sub(r'RESPONSE:\s*', '', clean_text, flags=re.IGNORECASE)
-
-    # 3. Clean up any leftover whitespace or stray quotes
     ai_response = clean_text.strip().strip('"\'')
 
-    # Fallback in case the LLM completely glitches out
     if not ai_response:
         ai_response = "I understand. Let's continue."
-
     if force_move_on:
         action = "move_on"
 
@@ -518,11 +513,11 @@ ACTION: repeat_question OR move_on
     save_session(body.session_id, session)
 
     return {
-        "ai_response": ai_response,
-        "action": action,
-        "question": session["current_question"],
-        "audio_b64": audio_b64,
-        "force_ended": force_move_on,
+        "ai_response":  ai_response,
+        "action":       action,
+        "question":     session["current_question"],
+        "audio_b64":    audio_b64,
+        "force_ended":  force_move_on,
     }
 
 
@@ -530,7 +525,7 @@ ACTION: repeat_question OR move_on
 
 class EndRequest(BaseModel):
     session_id: str
-    reason: str | None = None  # Allow frontend to pass termination reason
+    reason: str | None = None
 
 
 @router.post("/end")
@@ -538,10 +533,11 @@ async def end_interview(body: EndRequest):
     session = get_session(body.session_id)
     if session["status"] == "active":
         if body.reason:
-            session["status"] = "terminated"
-            session["terminated"] = True
+            session["status"]              = "terminated"
+            session["terminated"]          = True
+            session["termination_reason"]  = "cheating"
             session["termination_message"] = body.reason
-            session["misbehavior_count"] = 3
+            session["cheat_count"]         = 3
         else:
             session["status"] = "completed"
     save_session(body.session_id, session)
@@ -552,39 +548,38 @@ async def end_interview(body: EndRequest):
 
 @router.get("/report/{session_id}")
 async def get_report(session_id: str):
-    session = get_session(session_id)
+    session       = get_session(session_id)
     is_terminated = session.get("terminated", False)
 
-    # If terminated with zero history, gracefully return a blank report
-    # instead of crashing with a 400 error.
     if not session["history"]:
         return {
-            "session_id": session_id,
-            "role": session["role"],
-            "level": session["level"],
+            "session_id":   session_id,
+            "role":         session["role"],
+            "level":        session["level"],
             "questions_answered": 0,
-            "misbehavior_count": session.get("misbehavior_count", 0),
-            "terminated": is_terminated,
-            "termination_message": session.get("termination_message", "Interview ended before answering any questions."),
-            "misbehavior_log": session.get("misbehavior_log", []),
+            "misbehavior_count":  session.get("cheat_count", 0) + session.get("evasive_count", 0),
+            "terminated":         is_terminated,
+            "termination_reason": session.get("termination_reason"),
+            "termination_message": session.get(
+                "termination_message",
+                "Interview ended before answering any questions.",
+            ),
+            "idk_count":          session.get("idk_count", 0),
+            "misbehavior_log":    session.get("misbehavior_log", []),
             "speech_metrics_log": [],
             "feedback": {
-                "overall_score": 0,
-                "confidence_score": 0,
-                "clarity_score": 0,
-                "technical_depth_score": 0,
-                "communication_score": 0,
-                "behaviour_score": 0,
-                "speech_clarity_score": 0,
-                "summary": "The interview ended before any answers were recorded. No performance data is available.",
-                "speech_summary": "No speech data recorded.",
+                "overall_score": 0, "confidence_score": 0, "clarity_score": 0,
+                "technical_depth_score": 0, "communication_score": 0,
+                "behaviour_score": 0, "speech_clarity_score": 0,
+                "executive_summary":
+                    "The interview ended before any valid answers were recorded. "
+                    "No performance data is available.",
+                "speech_summary":         "No speech data recorded.",
                 "confidence_calibration": "under-confident",
-                "confidence_note": "Interview ended before meaningful data could be collected.",
-                "strengths": [],
-                "improvements": ["Complete at least one full answer before the interview can be assessed."],
-                "behavioral_flags": [],
-                "question_feedback": [],
-                "recommended_topics": [],
+                "confidence_note":
+                    "Interview ended before meaningful data could be collected.",
+                "strengths": [], "improvements": [], "behavioral_flags": [],
+                "question_feedback": [], "learning_path": [],
             },
         }
 
@@ -595,33 +590,35 @@ async def get_report(session_id: str):
         misbehavior_log=session.get("misbehavior_log"),
         speech_metrics_log=session.get("speech_metrics_log", []),
         is_terminated=is_terminated,
+        termination_reason=session.get("termination_reason"),
     )
 
     return {
-        "session_id": session_id,
-        "role": session["role"],
-        "level": session["level"],
+        "session_id":         session_id,
+        "role":               session["role"],
+        "level":              session["level"],
         "questions_answered": len(session["history"]),
-        "misbehavior_count": session.get("misbehavior_count", 0),
-        "terminated": session.get("terminated", False),
+        "misbehavior_count":  session.get("cheat_count", 0) + session.get("evasive_count", 0),
+        "idk_count":          session.get("idk_count", 0),
+        "terminated":         session.get("terminated", False),
+        "termination_reason": session.get("termination_reason"),
         "termination_message": session.get("termination_message", ""),
-        "misbehavior_log": session.get("misbehavior_log", []),
+        "misbehavior_log":    session.get("misbehavior_log", []),
         "speech_metrics_log": session.get("speech_metrics_log", []),
-        "feedback": feedback,
+        "feedback":           feedback,
     }
 
-
-# ── Session state ──────────────────────────────────────────────────────────────
 
 @router.get("/session/{session_id}")
 async def get_session_state(session_id: str):
     session = get_session(session_id)
     return {
-        "session_id": session_id,
-        "status": session["status"],
-        "question_count": session["question_count"],
-        "current_question": session.get("current_question"),
-        "role": session["role"],
-        "level": session["level"],
-        "misbehavior_count": session.get("misbehavior_count", 0),
+        "session_id":        session_id,
+        "status":            session["status"],
+        "question_count":    session["question_count"],
+        "current_question":  session.get("current_question"),
+        "role":              session["role"],
+        "level":             session["level"],
+        "misbehavior_count": session.get("cheat_count", 0),
+        "idk_count":         session.get("idk_count", 0),
     }
