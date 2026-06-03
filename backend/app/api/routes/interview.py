@@ -24,7 +24,7 @@ from app.services.feedback_engine import generate_feedback
 from app.services.groq_client import transcribe, text_to_speech
 
 # ── v10: Transcription Normalizer ─────────────────────────────────────────────
-from app.services.transcription_normalizer import normalize_transcript, build_stt_prompt
+#from app.services.transcription_normalizer import normalize_transcript, build_stt_prompt
 
 from app.core.config import settings
 
