@@ -258,7 +258,7 @@ NEXT_PUBLIC_API_URL=http://localhost:8000
 
 | Name | Role |
 |--------|------|
-| Nikhil Singh | Founder & Developer |
+| Nikhil Singh | Developer |
 | Harsh | Developer |
 
 ---
