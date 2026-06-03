@@ -234,12 +234,7 @@ async def transcribe_audio(audio: UploadFile = File(...)):
         print(f"[STT] Raw transcript: {raw_text[:120]}")
 
         # v10: Layer 2 static normalization
-        clean_text = normalize_transcript(raw_text, resume_data=None)
-
-        if clean_text != raw_text:
-            print(f"[STT NORM] Fixed: {raw_text[:80]} → {clean_text[:80]}")
-
-        return {"transcript": clean_text}
+        return {"transcript": raw_text}
 
     except Exception as e:
         print(f"[STT ERROR] {e}")
@@ -316,15 +311,7 @@ async def next_question(body: NextQuestionRequest):
         raise HTTPException(400, "Interview is not active")
 
     # v10: Layer 2 resume-aware normalization
-    clean_transcript = normalize_transcript(
-        body.transcript,
-        resume_data=session["resume_data"],
-    )
-    if clean_transcript != body.transcript:
-        print(
-            f"[NORM resume-aware] "
-            f"{body.transcript[:60]} → {clean_transcript[:60]}"
-        )
+     clean_transcript = body.transcript
 
     speech = compute_speech_metrics(clean_transcript)
     session["speech_metrics_log"].append({
