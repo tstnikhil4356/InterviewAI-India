@@ -1,0 +1,30 @@
+# Dependencies
+node_modules/
+.pnp
+.pnp.js
+
+# Next.js
+frontend/.next/
+frontend/out/
+frontend/build/
+
+# Python
+venv/
+backend/venv/
+backend/__pycache__/
+backend/app/__pycache__/
+backend/app/**/__pycache__/
+backend/*.pyc
+backend/.pytest_cache/
+
+# Env files
+.env
+.env.local
+.env.production
+backend/.env
+frontend/.env.local
+
+# Misc
+.DS_Store
+*.log
+.vercel
