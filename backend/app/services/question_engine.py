@@ -289,18 +289,20 @@ This answer came through a Speech-to-Text engine. Assume words may be misspelled
 technical names may be phonetically garbled, and sentences may be cut off mid-thought.
 
 Apply benefit of the doubt when:
-• A word looks like a garbled tool/product name but fits the context
-  (e.g. "anet" or "n8n", "sapier"→"Zapier", "appify"→"Apify", "cohere"→"Cohere",
-   "lama"→"LLaMA", "open ai"→"OpenAI", "make"→"Make.com automation tool")
-• A sentence is cut off but the words before the cut contain real content
-• The candidate uses informal phrasing for a real concept
+- A word looks like a garbled tool/product name but fits the context
+  (e.g. "anet" → n8n, "sapier" → Zapier, "appify" → Apify, "cohere" → Cohere,
+   "lama" → LLaMA, "open ai" → OpenAI, "make" → Make.com automation tool,
+   "pie torch" → PyTorch, "post gres" → PostgreSQL, "kube rnetes" → Kubernetes)
+- A sentence is cut off but the words before the cut contain real content
+- The candidate uses informal phrasing for a real concept
   (e.g. "the Google sheets node that adds rows" = Google Sheets append node)
+- Abbreviations spoken letter-by-letter: "a w s" = AWS, "l l m" = LLM, "j w t" = JWT
 
 Do NOT penalise for:
-• Misspelled tool names when the context makes the tool obvious
-• Filler words (um, uh, like) mixed into a substantive answer
-• Informal or imprecise phrasing when a real concept is being described
-• Short answers that contain one genuinely specific thing
+- Misspelled tool names when the context makes the tool obvious
+- Filler words (um, uh, like) mixed into a substantive answer
+- Informal or imprecise phrasing when a real concept is being described
+- Short answers that contain one genuinely specific thing
 
 ━━━ RULE 1 — PARROTING CHECK (mandatory, run before labelling) ━━━━━━━━━━━━━━
 Strip every word that appeared in the question. What remains?
@@ -310,50 +312,151 @@ Exception: if what remains is "I don't know" or similar → admitted_gap, not ev
 
 ━━━ RULE 2 — LABEL (first match wins) ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
+────────────────────────────────────────────────────────────────────────────────
 rude
   Hostile, offensive, or aggressive language toward the interviewer or process.
 
+  IS rude:
+  • "This is a stupid question."
+  • "You keep asking the same thing, stop."
+  • "I don't give a damn about your rubric."
+
+  NOT rude:
+  • "I don't think that question applies to my role." (pushback, not hostility)
+  • "I already covered that." (frustration, but not aggressive)
+  • "I'm not sure I understand the question." (confusion, not rude)
+
+────────────────────────────────────────────────────────────────────────────────
 gibberish
   Completely incoherent, random characters, or literally nothing understandable.
-  Messy STT is NOT gibberish unless zero meaning survives.
+  Messy STT is NOT gibberish unless zero meaning survives after charitable reading.
 
+  IS gibberish:
+  • "um um um um um" with nothing else
+  • "[no response]"
+  • "asdf jkl qwerty"
+  • A single isolated word with no relation to anything: "banana"
+
+  NOT gibberish (STT noise with real content underneath):
+  • "I used pie torch and the the the model trained on on GPU" → PyTorch, GPU training
+  • "we uh deployed on kube rnetes with helm" → Kubernetes + Helm
+  • "so basically the the anet workflow triggers the webhook" → n8n + webhook trigger
+
+────────────────────────────────────────────────────────────────────────────────
 fabricated
   Claims specific projects, companies, or degrees clearly absent from the resume.
-  NOT fabricated: adding detail to a resume item; technical synonyms; more depth
-  on a listed role.
+  The fabrication must be specific and structural — not just added technical detail.
 
+  IS fabricated:
+  • Resume lists no Google experience; answer says "when I interned at Google..."
+  • Resume shows a small startup; answer claims "I led a team of 40 engineers"
+  • Resume shows a bootcamp; answer claims "my CS degree from MIT..."
+
+  NOT fabricated:
+  • Adding technical depth to a listed project ("we also used Redis for caching"
+    even if the resume doesn't specifically mention Redis for that project)
+  • Using a different name for the same tool ("we used Postgres" when resume says
+    "PostgreSQL" — same thing)
+  • Describing internal decisions or team dynamics at a listed company
+  • Saying they know a concept not explicitly listed but plausible given their stack
+
+────────────────────────────────────────────────────────────────────────────────
 evasive
-  Deliberately avoids the question; pure parrot (see Rule 1); "it depends" alone
-  with nothing else; explicit refusal; topic switch with no content.
+  Deliberately avoids the question. Explicit refusal. Pure parrot with no new content.
+  "It depends" or "there are many ways" with absolutely nothing else added.
 
+  IS evasive:
+  • Q: "What broke in your project?" A: "Things break in projects sometimes." (pure parrot)
+  • Q: "What was your biggest mistake?" A: "I prefer not to discuss that."
+  • Q: "How did you handle X?" A: "It depends on the situation." (nothing more)
+  • Q: "What trade-off did you make?" A: "There are always trade-offs in engineering."
+  • Q: "Tell me about your Redis usage." A: "I've worked with many databases." (topic switch)
+
+  NOT evasive:
+  • "It depends — for high throughput we used Kafka, for simple jobs we used Redis."
+    (expands the hedge with real content → ok)
+  • "I'm not sure I answered your question — what I meant was X."
+    (self-correction with content → ok or vague depending on X)
+  • "I haven't used that specific tool but I've used Y which does the same thing."
+    (honest pivot with content → admitted_gap or ok)
+
+────────────────────────────────────────────────────────────────────────────────
 admitted_gap
   Explicitly says they don't know, can't remember, haven't used it, or need to study it.
-  NOT admitted_gap when real content follows the uncertainty hedge.
+  The uncertainty must be the main substance of the answer.
 
+  IS admitted_gap:
+  • "I don't know Kubernetes — haven't had a chance to use it yet."
+  • "I'm not familiar with that tool."
+  • "Honestly I can't remember the specifics of that incident."
+  • "I haven't worked with message queues, that's a gap I know I have."
+
+  NOT admitted_gap (hedge followed by real content → ok or vague):
+  • "I'm not sure about the exact API but I used OAuth2 with refresh tokens."
+    (hedge + specific content → ok)
+  • "I don't know the internal implementation but from what I've used, Redis
+    stores keys in memory with optional TTL persistence." (hedge + real knowledge → ok)
+  • "I haven't used Terraform specifically but I've done the same thing with
+    Ansible and AWS CloudFormation." (honest gap + real alternative → ok)
+
+────────────────────────────────────────────────────────────────────────────────
 vague
-  Relevant and genuine BUT only general statements — no specific tool named, no
-  concrete decision described, no number, no trade-off, no named methodology.
-  Use this ONLY when the answer has zero specific anchors. If even one specific
-  concept, tool name (even garbled), step name, or metric appears → ok instead.
+  Relevant and genuine BUT only general statements with zero specific anchors.
+  No tool named, no concrete decision, no number, no trade-off, no named methodology.
+  Use this ONLY when NOTHING specific survives after reading charitably.
 
+  IS vague:
+  • "I used caching to improve performance." (which cache? what performance? how much?)
+  • "We optimised the database queries." (how? which queries? what was the result?)
+  • "I handled authentication in the backend." (how? which method? what stack?)
+  • "I've worked with various cloud platforms depending on the project."
+  • "I followed best practices for the deployment."
+  • "The team decided to refactor because the codebase was getting complex."
+
+  NOT vague — even one specific anchor makes it ok:
+  • "I used Redis for caching." (tool named → ok)
+  • "We cut query time by 40%." (metric → ok)
+  • "I used JWT with a 15-minute expiry." (specific method + config → ok)
+  • "We switched from polling to webhooks because of the latency." (decision + reason → ok)
+  • "I used pie torch" (garbled PyTorch → STT error, but tool named → ok)
+
+────────────────────────────────────────────────────────────────────────────────
 ok
-  The answer contains at least ONE of:
-  • A specific tool or technology named (even if the STT spelling is off)
-  • A concrete decision or trade-off described
-  • A specific method, step, or process named
-  • A number, metric, or measurable outcome mentioned
-  • Structured reasoning ("first X, then Y, because Z")
-  • A real scenario with named actors or systems
-  This label should be the DEFAULT when the candidate has clearly tried to answer
-  with real content but you are uncertain between vague and ok. Lean toward ok.
+  The answer contains at least ONE specific anchor. This is the DEFAULT label
+  when the candidate has clearly tried to answer with real content.
+
+  Specific anchors — any ONE of these qualifies:
+  • A tool or technology named, even if the spelling is garbled by STT
+  • A concrete decision or trade-off ("we chose X over Y because Z")
+  • A specific method, pattern, or process named ("used a circuit breaker pattern")
+  • A number, metric, or measurable outcome ("reduced latency by 200ms")
+  • Structured reasoning with real steps ("first profiled, found the bottleneck,
+    then added an index, re-ran benchmarks")
+  • A real scenario with named systems or actors
+  • A specific failure mode or edge case described
+
+  IS ok (even if brief or imperfect):
+  • "I used Redis with a 30-minute TTL for session data." (tool + config)
+  • "We hit OOM errors at around 50k concurrent users so we added horizontal scaling."
+    (metric + decision)
+  • "I chose Postgres over Mongo because we had relational data with complex joins."
+    (trade-off with reason)
+  • "The bug was a race condition in the job queue — two workers were picking the same task."
+    (specific root cause)
+  • "I used pie torch" alone — STT for PyTorch, tool named → ok
+  • "First we profiled it, then we found a missing index, added it, and got about
+    a 3x speedup." (steps + metric)
+
+  Lean toward ok when uncertain between vague and ok. A short answer with one
+  real technical word is ok. A long answer with zero specific anchors is vague.
 
 ━━━ HARD LINE ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 On-topic ≠ answered. If the answer adds nothing beyond what was in the question → evasive.
 But if the candidate names ANYTHING specific — even one garbled tool name — that is NOT vague.
+When in doubt between two labels, always pick the less punishing one.
 
 Respond ONLY with valid JSON (no markdown, no explanation):
 {"quality": "<label>", "reason": "<one concise sentence>"}"""
-
 
 # At module level — add this near the other pattern constants
 CONCESSIVE_GUARDS = frozenset({
