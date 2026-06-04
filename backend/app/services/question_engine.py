@@ -177,6 +177,8 @@ def _safe_truncate(text: str, max_chars: int) -> str:
 
 # ── Interviewer persona ───────────────────────────────────────────────────────
 
+# ── Interviewer persona ───────────────────────────────────────────────────────
+
 SYSTEM_PROMPT = """You are a senior technical interviewer with 15 years of engineering experience.
 You've interviewed hundreds of engineers across startups and large tech companies.
 You're direct, fair, and you sound like a real person — not a scoring rubric.
@@ -188,13 +190,16 @@ YOUR VOICE:
 - Wrong answer: Correct it cleanly. "That's not quite right — [correct fact]. Here's why it matters."
 - Rambling: Cut it off. "Let me stop you there."
 - Nervous candidate: Brief, calm acknowledgement and move on. Don't over-reassure.
+- Pushing back or delivering criticism: skip the acknowledgement entirely — lead directly
+  with the observation. Never say "Okay, that was vague." Say "That was vague."
 
 BANNED WORDS/PHRASES — NEVER USE:
 "great", "amazing", "awesome", "interesting", "I see", "perfect", "absolutely",
 "fantastic", "excellent", "wonderful", "sure thing", "of course", "certainly",
 "no problem", "that's a great question", "good question", "I appreciate that"
 
-ACKNOWLEDGEMENT — rotate naturally, never repeat the same one twice in a row:
+ACKNOWLEDGEMENT — use only for adequate or good answers, rotate naturally,
+never repeat the same one twice in a row:
 "Got it.", "Okay.", "Fair enough.", "That makes sense.", "Noted.", "Understood.",
 "Alright.", "Right.", "Okay, that helps.", "Makes sense.", "Clear.", "Good to know.",
 "Mm-hmm.", "Right, okay.", "That tracks.", "Sure.", "Okay, I hear you."
@@ -211,6 +216,11 @@ CRITICAL FORMAT RULES — no exceptions:
 QUESTION STYLE:
 - One question per turn. Always.
 - Ground every question in something from their resume or their last answer.
+- CRITICAL: Always read the role title before assuming what the candidate did.
+  An "Administrative Executive" is not an automation engineer. A "Marketing Intern"
+  is not a backend developer. A "Sales Associate" is not a data scientist.
+  Ask about what the role TITLE suggests they owned — not what technologies
+  appear nearby on the resume under a different role.
 - Projects: decisions made, trade-offs, what broke, what you'd redo, specific numbers.
 - Experience: what you personally owned, what went wrong, what your manager would say.
 - Skills: real scenario, edge case, or architectural trade-off — never a definition.
@@ -276,11 +286,6 @@ _QUALITY_LABELS = frozenset({
     "gibberish", "evasive", "vague", "ok", "rude", "fabricated", "admitted_gap"
 })
 
-# FIX v19.1: STT-leniency is now the FIRST rule the model reads, before any
-# label definitions. The core insight: judge INTENT and STRUCTURE, not spelling.
-# "Anet", "sapier", "appify" are clearly STT renderings of n8n, Zapier, Apify.
-# Any word that appears to be a proper noun (capitalised concept, product-name
-# shape) inside a substantive sentence should be treated as a tool name.
 _ASSESS_SYSTEM = """You are an interview answer quality judge. Your job is to assess whether the candidate
 actually answered the question — not whether their grammar is perfect.
 
@@ -379,17 +384,26 @@ evasive
     (self-correction with content → ok or vague depending on X)
   • "I haven't used that specific tool but I've used Y which does the same thing."
     (honest pivot with content → admitted_gap or ok)
+  • "That wasn't really my area — I was on the ops side, not engineering."
+    (role clarification → admitted_gap, not evasive)
 
 ────────────────────────────────────────────────────────────────────────────────
 admitted_gap
   Explicitly says they don't know, can't remember, haven't used it, or need to study it.
-  The uncertainty must be the main substance of the answer.
+  Also covers role clarifications — if the candidate says the question doesn't match
+  their actual responsibilities at that role, that is admitted_gap, NOT evasive.
+  The uncertainty or mismatch must be the main substance of the answer.
 
   IS admitted_gap:
   • "I don't know Kubernetes — haven't had a chance to use it yet."
   • "I'm not familiar with that tool."
   • "Honestly I can't remember the specifics of that incident."
   • "I haven't worked with message queues, that's a gap I know I have."
+  • "I was in an admin role there — I wasn't handling the technical side."
+  • "That wasn't part of my responsibilities at that company."
+  • "My role was more operational — I didn't build or manage that."
+  • "I was an Administrative Executive, not an engineer — I didn't do automation there."
+  • "That question doesn't really apply to what I did in that position."
 
   NOT admitted_gap (hedge followed by real content → ok or vague):
   • "I'm not sure about the exact API but I used OAuth2 with refresh tokens."
@@ -458,10 +472,12 @@ When in doubt between two labels, always pick the less punishing one.
 Respond ONLY with valid JSON (no markdown, no explanation):
 {"quality": "<label>", "reason": "<one concise sentence>"}"""
 
-# At module level — add this near the other pattern constants
+
+# ── Concessive guard set (used in assess_answer fast-path 3) ──────────────────
+
 CONCESSIVE_GUARDS = frozenset({
-    "but", "however", "although", "though", "that", "still", "yet",
-    "although", "nonetheless", "nevertheless", "regardless", "even",
+    "but", "however", "although", "though", "still", "yet",
+    "nonetheless", "nevertheless", "regardless", "even", "that",
 })
 
 
@@ -1458,4 +1474,16 @@ def parse_response(text: str) -> dict:
 
 
 def extract_question_only(text: str) -> str:
-    return parse_response(text).get("question") or text.strip()
+    parsed = parse_response(text)
+    question = parsed.get("question", "").strip()
+    if question:
+        return question
+    # LLM sometimes writes the opening question into REACTION field
+    # (nothing to react to, so it fills REACTION instead of QUESTION).
+    # If REACTION contains a question mark, it IS the question — use it.
+    reaction = parsed.get("reaction", "").strip()
+    if reaction and "?" in reaction:
+        return reaction
+    # Last resort — return raw text but strip any REACTION:/QUESTION: labels
+    clean = re.sub(r'^(REACTION|QUESTION)\s*:\s*', '', text.strip(), flags=re.IGNORECASE)
+    return clean.strip()

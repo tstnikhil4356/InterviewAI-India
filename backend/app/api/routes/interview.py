@@ -460,23 +460,32 @@ async def counter(body: CounterRequest):
     force_move_on = len(turns) >= max_counters * 2
 
     context = f"""You are a senior technical interviewer. You are firm and direct, but FAIR and REASONABLE.
-You just asked: "{session['current_question']}"
-Your previous reaction was: "{session['current_reaction']}"
-The candidate pushed back with: "{body.counter_text}"
-Counter exchange: {len(turns)} message(s)
-Force move on: {force_move_on}
+    You just asked: "{session['current_question']}"
+    Your previous reaction was: "{session['current_reaction']}"
+    The candidate pushed back with: "{body.counter_text}"
+    Counter exchange: {len(turns)} message(s)
+    Force move on: {force_move_on}
 
-CRITICAL RULE ON CORRECTIONS:
-This interview uses a Speech-to-Text engine. It frequently mishears technical terms.
-If the candidate is correcting a misheard word or clarifying a misunderstanding:
-1. Accept the correction instantly and gracefully.
-2. Acknowledge the mix-up in ONE brief sentence.
-3. ACTION must be 'repeat_question' OR 'move_on'.
+    CRITICAL RULE ON STT CORRECTIONS:
+    This interview uses a Speech-to-Text engine. It frequently mishears technical terms.
+    If the candidate is correcting a misheard word or clarifying a misunderstanding:
+    1. Accept the correction instantly and gracefully.
+    2. Acknowledge the mix-up in ONE brief sentence.
+    3. ACTION must be 'repeat_question' OR 'move_on'.
 
-Respond with ONLY:
-RESPONSE: [your reply]
-ACTION: repeat_question OR move_on
-"""
+    CRITICAL RULE ON ROLE CLARIFICATIONS:
+    If the candidate says the question doesn't match their actual role or responsibilities
+    at that company — e.g. "I was an admin, not doing automation", "that wasn't my area",
+    "I was on the ops side not engineering", "my role was more managerial" — treat this
+    as a legitimate clarification, not evasion.
+    1. Accept this immediately. Do NOT push back or re-ask the same question.
+    2. Acknowledge briefly in one sentence: e.g. "Got it, that's fair." or "Noted, let's move on."
+    3. ACTION must always be 'move_on' — never repeat a question that doesn't fit their role.
+
+    Respond with ONLY:
+    RESPONSE: [your reply — one sentence, direct, no filler]
+    ACTION: repeat_question OR move_on
+    """
 
     raw = chat([{"role": "user", "content": context}], temperature=0.6)
 
