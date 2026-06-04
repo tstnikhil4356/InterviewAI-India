@@ -219,7 +219,13 @@ async def transcribe_audio(audio: UploadFile = File(...)):
         return {"transcript": "[no response]"}
 
     try:
-        raw_text = transcribe(audio_bytes, filename=audio.filename or "answer.webm")
+        # Fix: "blob" has no extension → Groq rejects it
+        import os
+        filename = audio.filename or ""
+        if not os.path.splitext(filename)[1]:
+            filename = "answer.webm"
+
+        raw_text = transcribe(audio_bytes, filename=filename)
         print(f"[STT] Raw transcript: {raw_text[:120]}")
 
         clean_text = normalize_transcript(raw_text, resume_data=None)
